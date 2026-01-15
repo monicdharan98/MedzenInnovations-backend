@@ -40,10 +40,7 @@ if (missingEnvVars.length > 0) {
 console.log("🔧 Configuration loaded:");
 console.log("   - Node Environment:", process.env.NODE_ENV || "development");
 console.log("   - Port:", process.env.PORT || 5000);
-console.log(
-  "   - Frontend URL:",
-  allowedOrigins
-);
+console.log("   - CORS: Dynamic configuration (Vercel & Localhost)");
 console.log(
   "   - Supabase URL:",
   process.env.SUPABASE_URL ? "✓ Set" : "✗ Missing"
@@ -89,12 +86,39 @@ const getAllowedOrigins = () => {
   return defaultOrigins;
 };
 
-const allowedOrigins = getAllowedOrigins();
+// Dynamic CORS configuration
+const corsOptionsDelegate = (req, callback) => {
+  const allowedOrigins = getAllowedOrigins();
+  const origin = req.header("Origin");
+
+  let corsOptions;
+  if (!origin) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    corsOptions = { origin: true };
+  } else if (allowedOrigins.indexOf(origin) !== -1) {
+    // Check if origin is in the allowed list
+    corsOptions = { origin: true };
+  } else if (origin.endsWith(".vercel.app")) {
+    // Allow any Vercel deployment
+    corsOptions = { origin: true };
+  } else {
+    console.log("🚫 CORS blocked:", origin);
+    corsOptions = { origin: false };
+  }
+  callback(null, corsOptions);
+};
 
 // Initialize Socket.IO with improved reconnection settings
 const io = new Server(httpServer, {
   cors: {
-    origin: allowedOrigins,
+    origin: (origin, callback) => {
+      const allowedOrigins = getAllowedOrigins();
+      if (!origin || allowedOrigins.indexOf(origin) !== -1 || origin.endsWith(".vercel.app")) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   },
@@ -110,17 +134,10 @@ const io = new Server(httpServer, {
 });
 
 // Middleware
-app.use(
-  cors({
-    origin: allowedOrigins,
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
+app.use(cors(corsOptionsDelegate));
 
 // Handle preflight requests explicitly
-app.options("*", cors());
+app.options("*", cors(corsOptionsDelegate));
 
 app.use(express.json({ limit: "50mb" })); // Increased for larger payloads
 app.use(express.urlencoded({ extended: true, limit: "50mb" })); // Increased for form data
@@ -137,7 +154,7 @@ app.get("/health", (req, res) => {
     message: "Backend server is running",
     timestamp: new Date().toISOString(),
     environment: process.env.NODE_ENV || "development",
-    cors: allowedOrigins,
+    cors: "Using dynamic configuration",
   });
 });
 
