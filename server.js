@@ -42,7 +42,7 @@ console.log("   - Node Environment:", process.env.NODE_ENV || "development");
 console.log("   - Port:", process.env.PORT || 5000);
 console.log(
   "   - Frontend URL:",
-  process.env.FRONTEND_URL || "http://localhost:5173"
+  allowedOrigins
 );
 console.log(
   "   - Supabase URL:",
@@ -70,46 +70,49 @@ const app = express();
 // Create HTTP server
 const httpServer = createServer(app);
 
+// function to get allowed origins
+const getAllowedOrigins = () => {
+  const defaultOrigins = [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "https://medzen-frontend.vercel.app",
+    "https://www.medzen-frontend.vercel.app",
+    "https://medzen-innovations.vercel.app",
+    "https://www.medzen-innovations.vercel.app"
+  ];
+
+  if (process.env.FRONTEND_URL) {
+    const envOrigins = process.env.FRONTEND_URL.split(",").map((url) => url.trim());
+    return [...new Set([...defaultOrigins, ...envOrigins])];
+  }
+
+  return defaultOrigins;
+};
+
+const allowedOrigins = getAllowedOrigins();
+
 // Initialize Socket.IO with improved reconnection settings
 const io = new Server(httpServer, {
   cors: {
-    origin: process.env.FRONTEND_URL
-      ? process.env.FRONTEND_URL.split(",").map((url) => url.trim())
-      : [
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "https://medzen-frontend.vercel.app",
-        "https://www.medzen-frontend.vercel.app",
-        "https://medzen-innovations.vercel.app",
-        "https://www.medzen-innovations.vercel.app"
-      ],
+    origin: allowedOrigins,
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   },
   // Improved settings for Render and unstable connections
-  pingTimeout: 60000, // 60 seconds (default is 20s)
-  pingInterval: 25000, // 25 seconds (default is 25s)
-  upgradeTimeout: 30000, // 30 seconds (default is 10s)
-  maxHttpBufferSize: 1e8, // 100 MB (default is 1MB)
-  transports: ["websocket", "polling"], // Try websocket first, fallback to polling
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  upgradeTimeout: 30000,
+  maxHttpBufferSize: 1e8,
+  transports: ["websocket", "polling"],
   allowUpgrades: true,
-  perMessageDeflate: false, // Disable compression for better performance
+  perMessageDeflate: false,
   httpCompression: false,
 });
 
 // Middleware
 app.use(
   cors({
-    origin: process.env.FRONTEND_URL
-      ? process.env.FRONTEND_URL.split(",").map((url) => url.trim())
-      : [
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "https://medzen-frontend.vercel.app",
-        "https://www.medzen-frontend.vercel.app",
-        "https://medzen-innovations.vercel.app",
-        "https://www.medzen-innovations.vercel.app"
-      ],
+    origin: allowedOrigins,
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
@@ -134,7 +137,7 @@ app.get("/health", (req, res) => {
     message: "Backend server is running",
     timestamp: new Date().toISOString(),
     environment: process.env.NODE_ENV || "development",
-    cors: process.env.FRONTEND_URL || "localhost",
+    cors: allowedOrigins,
   });
 });
 
