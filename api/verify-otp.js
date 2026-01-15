@@ -43,7 +43,9 @@ export default async function handler(req, res) {
         "http://localhost:5173",
         "http://localhost:5174",
         "https://medzen-frontend.vercel.app",
-        "https://www.medzen-frontend.vercel.app"
+        "https://www.medzen-frontend.vercel.app",
+        "https://medzen-innovations.vercel.app",
+        "https://www.medzen-innovations.vercel.app"
     ];
 
     // Add any additional origins from environment variable
@@ -57,7 +59,7 @@ export default async function handler(req, res) {
     }
 
     const origin = req.headers.origin;
-    if (allowedOrigins.includes(origin)) {
+    if (origin && (allowedOrigins.includes(origin) || origin.endsWith(".vercel.app"))) {
         res.setHeader("Access-Control-Allow-Origin", origin);
     } else {
         res.setHeader("Access-Control-Allow-Origin", allowedOrigins[0]);
