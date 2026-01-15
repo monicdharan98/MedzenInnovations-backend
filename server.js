@@ -79,7 +79,9 @@ const io = new Server(httpServer, {
         "http://localhost:5173",
         "http://localhost:5174",
         "https://medzen-frontend.vercel.app",
-        "https://www.medzen-frontend.vercel.app"
+        "https://www.medzen-frontend.vercel.app",
+        "https://medzen-innovations.vercel.app",
+        "https://www.medzen-innovations.vercel.app"
       ],
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -104,7 +106,9 @@ app.use(
         "http://localhost:5173",
         "http://localhost:5174",
         "https://medzen-frontend.vercel.app",
-        "https://www.medzen-frontend.vercel.app"
+        "https://www.medzen-frontend.vercel.app",
+        "https://medzen-innovations.vercel.app",
+        "https://www.medzen-innovations.vercel.app"
       ],
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
