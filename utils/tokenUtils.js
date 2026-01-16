@@ -12,7 +12,7 @@ import { supabaseAdmin } from "../config/supabase.js";
  * @param {string} expiresIn - Token expiration time (default: 15m)
  * @returns {string} JWT access token
  */
-export const generateAccessToken = (payload, expiresIn = "15m") => {
+export const generateAccessToken = (payload, expiresIn = "24h") => {
   return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn });
 };
 
@@ -44,8 +44,8 @@ export const generateTokenPair = (user, rememberMe = false) => {
     name: user.name,
   };
 
-  // Access token - always short-lived for security
-  const accessToken = generateAccessToken(payload, "15m");
+  // Access token - 24 hours for better UX
+  const accessToken = generateAccessToken(payload, "24h");
 
   // Refresh token - longer lived, extended if "remember me"
   const refreshTokenExpiry = rememberMe ? "90d" : "30d";
@@ -54,7 +54,7 @@ export const generateTokenPair = (user, rememberMe = false) => {
   return {
     accessToken,
     refreshToken,
-    expiresIn: 15 * 60, // 15 minutes in seconds
+    expiresIn: 24 * 60 * 60, // 24 hours in seconds
     refreshExpiresIn: rememberMe ? 90 * 24 * 60 * 60 : 30 * 24 * 60 * 60, // in seconds
   };
 };
