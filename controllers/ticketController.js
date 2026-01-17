@@ -701,6 +701,90 @@ export const getUserTickets = async (req, res) => {
 
     const starredSet = new Set(starredTickets?.map(s => s.ticket_id) || []);
 
+    // --- OPTIMIZED LAST MESSAGE FETCH (Heuristic Batch) ---
+    // Step A: Fetch recent messages for ALL these tickets in one go
+    // We fetch (N * 5) messages to likely cover the last message of every active ticket
+    const batchLimit = ticketIds.length * 5;
+    let lastMessagesMap = new Map();
+    let ticketsNeedingFallback = new Set(ticketIds);
+
+    if (ticketIds.length > 0) {
+      const { data: recentMessages } = await supabaseAdmin
+        .from("ticket_messages")
+        .select(`
+            ticket_id,
+            message, 
+            message_type, 
+            created_at,
+            sender_id
+        `)
+        .in("ticket_id", ticketIds)
+        .order("created_at", { ascending: false })
+        .limit(batchLimit);
+
+      if (recentMessages) {
+        // Process from newest to oldest
+        for (const msg of recentMessages) {
+          // Since it's ordered by DESC, the first time we see a ticket_id, it is the latest message
+          if (!lastMessagesMap.has(msg.ticket_id)) {
+            lastMessagesMap.set(msg.ticket_id, msg);
+            ticketsNeedingFallback.delete(msg.ticket_id);
+          }
+        }
+      }
+    }
+
+    // Step B: Collect Sender IDs for the batch messages to fetch names
+    // (Optimization: reuse checks from usersMap)
+    const batchSenderIds = Array.from(lastMessagesMap.values()).map(m => m.sender_id);
+    const missingBatchSenderIds = batchSenderIds.filter(id => !usersMap.has(id));
+
+    if (missingBatchSenderIds.length > 0) {
+      const { data: interactionSenders } = await supabaseAdmin
+        .from("users")
+        .select("id, name")
+        .in("id", [...new Set(missingBatchSenderIds)]);
+
+      if (interactionSenders) {
+        interactionSenders.forEach(u => usersMap.set(u.id, u));
+      }
+    }
+
+    // Step C: Fallback for inactive tickets (N+1 but only for tickets NOT in top N*5 recent messages)
+    // These are usually old/inactive tickets where latency matters less, or few in number
+    const fallbackPromises = Array.from(ticketsNeedingFallback).map(async (missingTicketId) => {
+      const { data: fallbackMsg } = await supabaseAdmin
+        .from("ticket_messages")
+        .select(`
+              ticket_id,
+              message, 
+              message_type, 
+              created_at,
+              sender_id
+          `)
+        .eq("ticket_id", missingTicketId)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (fallbackMsg) {
+        lastMessagesMap.set(missingTicketId, fallbackMsg);
+        if (!usersMap.has(fallbackMsg.sender_id)) {
+          // Quick lookup for fallback sender
+          const { data: fs } = await supabaseAdmin
+            .from("users")
+            .select("id, name")
+            .eq("id", fallbackMsg.sender_id)
+            .single();
+          if (fs) usersMap.set(fs.id, fs);
+        }
+      }
+    });
+
+    if (fallbackPromises.length > 0) {
+      await Promise.all(fallbackPromises);
+    }
+
     // 7. Map everything back
     const ticketsWithDetails = await Promise.all(tickets.map(async (ticket) => {
       // Creator
@@ -725,30 +809,19 @@ export const getUserTickets = async (req, res) => {
       // Files
       const myFiles = allFiles.filter(f => f.ticket_id === ticket.id);
 
-      // Last Message (Single fetch per ticket, keeps it simple and reliable)
+      // Last Message (Retrieved from Batch Map)
       let lastMessage = null;
       let lastMessageSender = null;
 
-      const { data: lastMessageData } = await supabaseAdmin
-        .from("ticket_messages")
-        .select(`
-            message, 
-            message_type, 
-            sender_id
-          `)
-        .eq("ticket_id", ticket.id)
-        .order("created_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
+      const lastMsgData = lastMessagesMap.get(ticket.id);
 
-      if (lastMessageData) {
-        if (lastMessageData.message_type === "text") {
-          lastMessage = lastMessageData.message;
+      if (lastMsgData) {
+        if (lastMsgData.message_type === "text") {
+          lastMessage = lastMsgData.message;
         } else {
-          lastMessage = lastMessageData.message_type === "file" ? "📎 Sent a file" : "🖼️ Sent an image";
+          lastMessage = lastMsgData.message_type === "file" ? "📎 Sent a file" : "🖼️ Sent an image";
         }
-        // Small lookup for sender name from map
-        const sender = usersMap.get(lastMessageData.sender_id);
+        const sender = usersMap.get(lastMsgData.sender_id);
         lastMessageSender = sender?.name || "Unknown";
       }
 
