@@ -600,41 +600,29 @@ export const getUserTickets = async (req, res) => {
       return errorResponse(res, "Failed to fetch user details", 500);
     }
 
-    // OPTIMIZED QUERY: Fetch tickets with all related data using Supabase joins
-    // This replaces the previous N+1 logic where we looped through tickets to fetch specific details
+    // OPTIMIZED QUERY STRATEGY: BATCH FETCHING
+    // 1. Fetch relevant tickets first
+    // 2. Collect all User IDs and File relationships needed
+    // 3. Batch fetch all needed users and files in parallel
+    // 4. Map data back to tickets in memory
+    // This avoids N+1 queries AND avoids "Foreign Key not found" errors with Joins
 
     let query = supabaseAdmin
       .from("tickets")
-      .select(`
-        *,
-        created_by_user:users!created_by (id, name, email, role, profile_picture),
-        members:ticket_members (
-          role,
-          user:users (id, name, email, profile_picture, role)
-        ),
-        files:ticket_files (*)
-      `)
+      .select("*")
       .order("created_at", { ascending: false });
 
     // Apply role-based filtering
     if (user.role === "admin" || user.role === "employee") {
-      // Admin and Employee can see ALL tickets
       console.log(`User is ${user.role} - fetching all tickets`);
     } else {
-      // Clients/Users only see tickets they are members of OR created
       console.log(`User is ${user.role} - fetching only relevant tickets`);
 
-      // We need to fetch tickets where:
-      // 1. created_by = userId OR
-      // 2. userId is in ticket_members
-
-      // 1. Tickets created by user
       const { data: createdTickets } = await supabaseAdmin
         .from("tickets")
         .select("id")
         .eq("created_by", userId);
 
-      // 2. Tickets where user is member
       const { data: memberTickets } = await supabaseAdmin
         .from("ticket_members")
         .select("ticket_id")
@@ -664,37 +652,59 @@ export const getUserTickets = async (req, res) => {
       return successResponse(res, { tickets: [] }, "No tickets found");
     }
 
-    console.log(`📋 Fetched ${tickets.length} tickets with details`);
+    console.log(`📋 Fetched ${tickets.length} tickets - starting batch data load`);
 
-    // Use fetched tickets directly
-    let ticketsToFetch = tickets;
+    // --- BATCH FETCH STEPS ---
 
-    // Remove any potential duplicates by ticket ID (safety check)
-    const uniqueTicketsMap = new Map();
-    ticketsToFetch.forEach((ticket) => {
-      if (!uniqueTicketsMap.has(ticket.id)) {
-        uniqueTicketsMap.set(ticket.id, ticket);
+    // 1. Get all Ticket IDs
+    const ticketIds = tickets.map(t => t.id);
+
+    // 2. Fetch all Members and Files for these tickets in parallel
+    const [membersResult, filesResult] = await Promise.all([
+      supabaseAdmin
+        .from("ticket_members")
+        .select("ticket_id, user_id, role")
+        .in("ticket_id", ticketIds),
+      supabaseAdmin
+        .from("ticket_files")
+        .select("*")
+        .in("ticket_id", ticketIds)
+    ]);
+
+    const allMembers = membersResult.data || [];
+    const allFiles = filesResult.data || [];
+
+    // 3. Collect unique User IDs (Creators + Members)
+    const creatorIds = tickets.map(t => t.created_by).filter(Boolean);
+    const memberUserIds = allMembers.map(m => m.user_id).filter(Boolean);
+    const uniqueUserIds = [...new Set([...creatorIds, ...memberUserIds])];
+
+    // 4. Batch fetch all Users
+    let usersMap = new Map();
+    if (uniqueUserIds.length > 0) {
+      const { data: users } = await supabaseAdmin
+        .from("users")
+        .select("id, name, email, role, profile_picture")
+        .in("id", uniqueUserIds);
+
+      if (users) {
+        users.forEach(u => usersMap.set(u.id, u));
       }
-    });
-    ticketsToFetch = Array.from(uniqueTicketsMap.values());
+    }
 
-    console.log(`📋 Returning ${ticketsToFetch.length} unique tickets`);
+    // 6. Check "Starred" status
+    const { data: starredTickets } = await supabaseAdmin
+      .from("starred_tickets")
+      .select("ticket_id")
+      .eq("user_id", userId)
+      .in("ticket_id", ticketIds);
 
-    // Transform the data to match the expected frontend structure
-    const ticketsWithDetails = await Promise.all(ticketsToFetch.map(async (ticket) => {
-      // 1. Format members
-      const validMembers = (ticket.members || [])
-        .map(m => {
-          if (!m.user) return null;
-          return {
-            ...m.user,
-            role: m.user.role // ensure role is present
-          };
-        })
-        .filter(Boolean);
+    const starredSet = new Set(starredTickets?.map(s => s.ticket_id) || []);
 
-      // 2. Format creator
-      const creator = ticket.created_by_user || {
+    // 7. Map everything back
+    const ticketsWithDetails = await Promise.all(tickets.map(async (ticket) => {
+      // Creator
+      const creator = usersMap.get(ticket.created_by) || {
         id: ticket.created_by,
         name: "Deleted User",
         email: "deleted@user.com",
@@ -702,35 +712,29 @@ export const getUserTickets = async (req, res) => {
         profile_picture: null,
       };
 
-      // 3. Files are already in correct format from the join
-      const ticketFiles = ticket.files || [];
+      // Members
+      const myMembers = allMembers
+        .filter(m => m.ticket_id === ticket.id)
+        .map(m => {
+          const u = usersMap.get(m.user_id);
+          if (!u) return null;
+          return { ...u, role: m.role || u.role }; // Support override role in member table if exists
+        })
+        .filter(Boolean);
 
-      // 4. Get last message (Optimized)
-      // We already have members, so we know who the clients are
+      // Files
+      const myFiles = allFiles.filter(f => f.ticket_id === ticket.id);
+
+      // Last Message (Single fetch per ticket, keeps it simple and reliable)
       let lastMessage = null;
       let lastMessageSender = null;
-
-      // Identify client IDs for message filtering optimization
-      const clientIds = validMembers
-        .filter(u => u.role === "client")
-        .map(u => u.id);
-
-      if (creator && creator.role === "client") {
-        clientIds.push(creator.id);
-      }
-
-      // We can't easily join the "last message" in the main query because it requires ordering/limits per ticket
-      // But we can optimize by only querying if strictly needed or by batching in a future improvement.
-      // For now, we'll keep this single query per ticket but it's much faster than before 
-      // because we skip all the other lookups.
 
       const { data: lastMessageData } = await supabaseAdmin
         .from("ticket_messages")
         .select(`
             message, 
             message_type, 
-            sender_id,
-            sender:users!sender_id(name)
+            sender_id
           `)
         .eq("ticket_id", ticket.id)
         .order("created_at", { ascending: false })
@@ -740,21 +744,13 @@ export const getUserTickets = async (req, res) => {
       if (lastMessageData) {
         if (lastMessageData.message_type === "text") {
           lastMessage = lastMessageData.message;
-        } else if (lastMessageData.message_type === "file") {
-          lastMessage = "📎 Sent a file";
-        } else if (lastMessageData.message_type === "image") {
-          lastMessage = "🖼️ Sent an image";
+        } else {
+          lastMessage = lastMessageData.message_type === "file" ? "📎 Sent a file" : "🖼️ Sent an image";
         }
-        lastMessageSender = lastMessageData.sender?.name || "Unknown";
+        // Small lookup for sender name from map
+        const sender = usersMap.get(lastMessageData.sender_id);
+        lastMessageSender = sender?.name || "Unknown";
       }
-
-      // Check if ticket is starred (still needs individual check unfortunately, unless we join starred_tickets too)
-      const { data: starredData } = await supabaseAdmin
-        .from("starred_tickets")
-        .select("id")
-        .eq("ticket_id", ticket.id)
-        .eq("user_id", userId)
-        .maybeSingle();
 
       return {
         id: ticket.id,
@@ -766,14 +762,14 @@ export const getUserTickets = async (req, res) => {
         status: ticket.status,
         points: ticket.points || [],
         createdBy: creator,
-        members: validMembers,
-        files: ticketFiles,
+        members: myMembers,
+        files: myFiles,
         createdAt: ticket.created_at,
         updatedAt: ticket.updated_at,
         lastMessage: lastMessage,
         lastMessageSender: lastMessageSender,
-        isStarred: !!starredData,
-        // Legacy fields for backward compatibility
+        isStarred: starredSet.has(ticket.id),
+        // Legacy fields
         creator_name: creator.name,
         creator_email: creator.email,
         payment_stages: ticket.payment_stages
@@ -2230,7 +2226,14 @@ export const getTicketMessages = async (req, res) => {
       shouldFilterMessages: !isAdmin && !isCreator && membership?.added_at,
     });
 
-    // Build query - fetch messages
+    // Build query - fetch messages with sender and reply details using joins
+    // This replaces the N+1 pattern where we fetched sender details for each message
+    // OPTIMIZED QUERY STRATEGY: BATCH FETCHING for Messages
+    // 1. Fetch messages
+    // 2. Collect sender IDs and Reply IDs
+    // 3. Batch fetch users and reply messages
+    // 4. Map back
+
     let query = supabaseAdmin
       .from("ticket_messages")
       .select("*")
@@ -2310,121 +2313,105 @@ export const getTicketMessages = async (req, res) => {
       );
     }
 
-    // Fetch sender details for each message
+    if (!messages || messages.length === 0) {
+      // Return empty list immediately if no messages
+      return successResponse(res, { messages: [] }, "No messages found");
+    }
+
+    // --- BATCH FETCH DATA ---
+    const senderIds = messages.map(m => m.sender_id).filter(Boolean);
+    const replyMessageIds = messages.map(m => m.reply_to_message_id).filter(Boolean);
+
+    // Batch 1: Fetch all Senders
+    let usersMap = new Map();
+    if (senderIds.length > 0) {
+      const uniqueSenderIds = [...new Set(senderIds)];
+      const { data: users } = await supabaseAdmin
+        .from("users")
+        .select("id, email, name, profile_picture, role")
+        .in("id", uniqueSenderIds);
+
+      if (users) {
+        users.forEach(u => usersMap.set(u.id, u));
+      }
+    }
+
+    // Batch 2: Fetch all Replied Messages
+    let repliesMap = new Map();
+    if (replyMessageIds.length > 0) {
+      const uniqueReplyIds = [...new Set(replyMessageIds)];
+      const { data: replies } = await supabaseAdmin
+        .from("ticket_messages")
+        .select("id, message, message_type, sender_id, created_at, is_deleted")
+        .in("id", uniqueReplyIds);
+
+      if (replies) {
+        // Also need to know senders of replies
+        const replySenderIds = replies.map(r => r.sender_id).filter(Boolean);
+        const missingSenderIds = replySenderIds.filter(id => !usersMap.has(id));
+
+        if (missingSenderIds.length > 0) {
+          const { data: replySenders } = await supabaseAdmin
+            .from("users")
+            .select("id, name")
+            .in("id", [...new Set(missingSenderIds)]);
+
+          if (replySenders) {
+            replySenders.forEach(u => usersMap.set(u.id, u));
+          }
+        }
+
+        replies.forEach(r => repliesMap.set(r.id, r));
+      }
+    }
+
+    // Transform messages to match frontend structure
     const messagesWithSender = await Promise.all(
       (messages || []).map(async (message) => {
-        const { data: sender, error: senderError } = await supabaseAdmin
-          .from("users")
-          .select("id, email, name, profile_picture, role")
-          .eq("id", message.sender_id)
-          .single();
-
-        if (senderError) {
-          console.error(
-            "Error fetching sender for message:",
-            message.id,
-            senderError
-          );
-        }
-
-        // Fetch reply-to message if exists
-        let replyToMessage = null;
-        if (message.reply_to_message_id) {
-          console.log(
-            "🔔 API: Message has reply_to_message_id:",
-            message.reply_to_message_id
-          );
-
-          const { data: replyMsg, error: replyError } = await supabaseAdmin
-            .from("ticket_messages")
-            .select(
-              "id, sender_id, message, message_type, file_name, is_deleted, created_at"
-            )
-            .eq("id", message.reply_to_message_id)
-            .single();
-
-          if (replyError) {
-            console.error("❌ API: Error fetching reply message:", replyError);
-          }
-
-          if (!replyError && replyMsg) {
-            console.log("✅ API: Found reply message");
-
-            // Fetch reply message sender
-            const { data: replySender } = await supabaseAdmin
-              .from("users")
-              .select("id, name")
-              .eq("id", replyMsg.sender_id)
-              .single();
-
-            replyToMessage = {
-              id: replyMsg.id,
-              sender_id: replyMsg.sender_id,
-              sender_name: replySender?.name || "Unknown User",
-              message: replyMsg.is_deleted
-                ? "Message deleted"
-                : replyMsg.message,
-              message_type: replyMsg.message_type,
-              file_name: replyMsg.file_name,
-              created_at: replyMsg.created_at,
-            };
-
-            console.log("✅ API: Reply data prepared:", {
-              id: replyToMessage.id,
-              sender_name: replyToMessage.sender_name,
-              message_preview: replyToMessage.message?.substring(0, 50),
-            });
-          }
-        }
-
-        console.log("💬 Fetched sender for message:", {
-          messageId: message.id,
-          senderId: message.sender_id,
-          senderName: sender?.name,
-          senderEmail: sender?.email,
-          senderRole: sender?.role,
-          hasReply: !!replyToMessage,
-          fullSenderData: sender,
-        });
-
-        const userData = sender || {
+        // 1. Format sender (from map)
+        const userData = usersMap.get(message.sender_id) || {
           id: message.sender_id,
           name: "Unknown User",
           email: "",
           profile_picture: null,
+          role: "unknown"
         };
 
-        console.log("💬 Final userData for message:", {
-          id: userData.id,
-          name: userData.name,
-          email: userData.email,
-        });
+        // 2. Format reply (from map)
+        let replyToMessage = null;
+        if (message.reply_to_message_id) {
+          const reply = repliesMap.get(message.reply_to_message_id);
+          if (reply) {
+            const replySender = usersMap.get(reply.sender_id) || { name: 'Unknown' };
 
-        // Fetch forwarded message details if this is a forwarded message
+            replyToMessage = {
+              id: reply.id,
+              sender_id: reply.sender_id,
+              sender_name: replySender.name,
+              message: reply.is_deleted ? "Message deleted" : (reply.message_type === 'text' ? reply.message : (reply.message_type === 'image' ? 'Image' : 'File')),
+              message_type: reply.message_type,
+              created_at: reply.created_at
+            };
+          }
+        }
+
+        // 3. Forwarded messages (Keep existing logic for now as it's complex to join deeply)
         let forwardedFrom = null;
         if (
           message.forwarded_from_message_id &&
           message.forwarded_from_ticket_id
         ) {
-          console.log("🔄 API: Message is forwarded, fetching source details");
-
-          // Get source ticket details
+          // Keep existing manual fetch for forwarded messages for safety
+          // (Can be optimized later if needed)
           const { data: sourceTicket } = await supabaseAdmin
             .from("tickets")
             .select("id, ticket_number, title")
             .eq("id", message.forwarded_from_ticket_id)
             .single();
 
-          // Get original message and sender
           const { data: originalMessage } = await supabaseAdmin
             .from("ticket_messages")
-            .select(
-              `
-              id,
-              sender_id,
-              sender:users!ticket_messages_sender_id_fkey(id, name, email, role)
-            `
-            )
+            .select("id, sender_id, sender:users!ticket_messages_sender_id_fkey(id, name, email, role)")
             .eq("id", message.forwarded_from_message_id)
             .single();
 
@@ -2435,12 +2422,10 @@ export const getTicketMessages = async (req, res) => {
               ticketTitle: sourceTicket.title,
               originalSender: originalMessage.sender,
             };
-
-            console.log("✅ API: Forwarded metadata prepared:", forwardedFrom);
           }
         }
 
-        // Fetch who has seen this message
+        // 4. Seen By (Keep existing logic)
         let seenBy = [];
         const { data: seenRecords, error: seenError } = await supabaseAdmin
           .from('message_seen_by')
@@ -2460,19 +2445,19 @@ export const getTicketMessages = async (req, res) => {
         return {
           ...message,
           sender: userData,
-          user: userData, // Include both for compatibility
-          reply_to: replyToMessage, // Add reply information
-          forwarded_from: forwardedFrom, // Add forwarded message metadata (snake_case)
-          forwardedFrom: forwardedFrom, // Add camelCase version
-          isForwarded: !!forwardedFrom, // Boolean flag for easy detection
-          seen_by: seenBy // Add who has seen this message
+          user: userData,
+          reply_to: replyToMessage,
+          forwarded_from: forwardedFrom,
+          forwardedFrom: forwardedFrom,
+          isForwarded: !!forwardedFrom,
+          seen_by: seenBy
         };
       })
     );
 
     return successResponse(
       res,
-      { messages: messagesWithSender.reverse() },
+      { messages: messagesWithSender },
       "Messages fetched successfully"
     );
   } catch (error) {
@@ -2518,7 +2503,10 @@ export const addTicketMessage = async (req, res) => {
           file_url: fileUrl || null,
         },
       ])
-      .select("*")
+      .select(`
+        *,
+        sender:users!sender_id (id, email, name, profile_picture)
+      `)
       .single();
 
     if (messageError) {
@@ -2526,22 +2514,8 @@ export const addTicketMessage = async (req, res) => {
       return errorResponse(res, "Failed to add message", 500);
     }
 
-    // Fetch sender details
-    const { data: sender } = await supabaseAdmin
-      .from("users")
-      .select("id, email, name, profile_picture")
-      .eq("id", userId)
-      .single();
-
-    const messageWithSender = {
-      ...newMessage,
-      sender: sender || {
-        id: userId,
-        name: "Unknown User",
-        email: "",
-        profile_picture: null,
-      },
-    };
+    // Sender details are already in the response thanks to the join
+    const messageWithSender = newMessage;
 
     return successResponse(
       res,
