@@ -4,6 +4,100 @@ import { createTicketMessageNotification } from '../utils/notificationHelper.js'
 import { sendTicketMessageEmail } from '../utils/emailService.js';
 
 /**
+ * ============================================
+ * IN-MEMORY CACHE FOR PERFORMANCE OPTIMIZATION
+ * ============================================
+ * Reduces redundant Supabase queries during active socket sessions
+ */
+
+// Cache for ticket memberships: Map<`${ticketId}:${userId}`, { membership, timestamp }>
+const membershipCache = new Map();
+
+// Cache for user profiles: Map<userId, { user, timestamp }>
+const userProfileCache = new Map();
+
+// Cache TTL in milliseconds (5 minutes)
+const CACHE_TTL = 5 * 60 * 1000;
+
+/**
+ * Get cached membership or fetch from DB
+ */
+const getCachedMembership = async (ticketId, userId, role) => {
+  const cacheKey = `${ticketId}:${userId}`;
+  const cached = membershipCache.get(cacheKey);
+
+  if (cached && (Date.now() - cached.timestamp) < CACHE_TTL) {
+    return cached.data;
+  }
+
+  // For clients, check if they created the ticket first
+  if (role === 'client') {
+    const { data: ticket } = await supabaseAdmin
+      .from('tickets')
+      .select('created_by')
+      .eq('id', ticketId)
+      .single();
+
+    if (ticket && ticket.created_by === userId) {
+      const result = { isMember: true, isCreator: true, membership: null };
+      membershipCache.set(cacheKey, { data: result, timestamp: Date.now() });
+      return result;
+    }
+  }
+
+  // Check ticket_members table
+  const { data: membership } = await supabaseAdmin
+    .from('ticket_members')
+    .select('*, can_message_client')
+    .eq('ticket_id', ticketId)
+    .eq('user_id', userId)
+    .single();
+
+  const result = {
+    isMember: !!membership,
+    isCreator: false,
+    membership
+  };
+
+  membershipCache.set(cacheKey, { data: result, timestamp: Date.now() });
+  return result;
+};
+
+/**
+ * Get cached user profile or fetch from DB
+ */
+const getCachedUserProfile = async (userId) => {
+  const cached = userProfileCache.get(userId);
+
+  if (cached && (Date.now() - cached.timestamp) < CACHE_TTL) {
+    return cached.data;
+  }
+
+  const { data: user } = await supabaseAdmin
+    .from('users')
+    .select('id, email, name, profile_picture, role')
+    .eq('id', userId)
+    .single();
+
+  if (user) {
+    userProfileCache.set(userId, { data: user, timestamp: Date.now() });
+  }
+
+  return user;
+};
+
+/**
+ * Invalidate membership cache for a ticket (call when members change)
+ */
+const invalidateMembershipCache = (ticketId) => {
+  for (const key of membershipCache.keys()) {
+    if (key.startsWith(`${ticketId}:`)) {
+      membershipCache.delete(key);
+    }
+  }
+};
+
+/**
  * Handle all socket.io chat events
  */
 export const setupChatHandlers = (io) => {
@@ -64,68 +158,34 @@ export const setupChatHandlers = (io) => {
 
         console.log(`🎯 join_ticket attempt: userId=${socket.user.id}, ticketId=${ticketId}, role=${socket.user.role}`);
 
+        // ⚡ OPTIMIZED: Use cached membership check instead of multiple DB queries
+        const membershipResult = await getCachedMembership(ticketId, socket.user.id, socket.user.role);
+
         // For CLIENTS: Check if they created the ticket OR are in ticket_members
         if (socket.user.role === 'client') {
-          const { data: ticket } = await supabaseAdmin
-            .from('tickets')
-            .select('created_by')
-            .eq('id', ticketId)
-            .single();
-
-          // Allow if client created the ticket
-          if (ticket && ticket.created_by === socket.user.id) {
-            socket.join(`ticket:${ticketId}`);
-            console.log(`✅ Client ${socket.user.email} joined ticket ${ticketId} (creator)`);
-
-            socket.to(`ticket:${ticketId}`).emit('user_joined', {
-              userId: socket.user.id,
-              userName: socket.user.name,
-              ticketId
-            });
-
-            socket.emit('joined_ticket', { ticketId });
+          if (!membershipResult.isMember) {
+            console.log(`❌ Client ${socket.user.email} not authorized for ticket ${ticketId}`);
+            socket.emit('error', { message: 'You are not a member of this ticket' });
             return;
           }
 
-          // OR if client is in ticket_members
-          const { data: membership } = await supabaseAdmin
-            .from('ticket_members')
-            .select('*')
-            .eq('ticket_id', ticketId)
-            .eq('user_id', socket.user.id)
-            .single();
+          socket.join(`ticket:${ticketId}`);
+          console.log(`✅ Client ${socket.user.email} joined ticket ${ticketId} (${membershipResult.isCreator ? 'creator' : 'member'}) [CACHED]`);
 
-          if (membership) {
-            socket.join(`ticket:${ticketId}`);
-            console.log(`✅ Client ${socket.user.email} joined ticket ${ticketId} (member)`);
+          socket.to(`ticket:${ticketId}`).emit('user_joined', {
+            userId: socket.user.id,
+            userName: socket.user.name,
+            ticketId
+          });
 
-            socket.to(`ticket:${ticketId}`).emit('user_joined', {
-              userId: socket.user.id,
-              userName: socket.user.name,
-              ticketId
-            });
-
-            socket.emit('joined_ticket', { ticketId });
-            return;
-          }
-
-          // Reject if neither
-          console.log(`❌ Client ${socket.user.email} not authorized for ticket ${ticketId}`);
-          socket.emit('error', { message: 'You are not a member of this ticket' });
+          socket.emit('joined_ticket', { ticketId });
           return;
         }
 
         // For TEAM MEMBERS (admin, employee, freelancer): Check membership
-        const { data: membership, error } = await supabaseAdmin
-          .from('ticket_members')
-          .select('*')
-          .eq('ticket_id', ticketId)
-          .eq('user_id', socket.user.id)
-          .single();
-
         // ADMINS and EMPLOYEES can view all tickets (read-only if not member)
         // FREELANCERS must be added as members
-        if (!membership && socket.user.role !== 'admin' && socket.user.role !== 'employee') {
+        if (!membershipResult.isMember && socket.user.role !== 'admin' && socket.user.role !== 'employee') {
           console.log(`❌ Freelancer ${socket.user.email} not authorized for ticket ${ticketId}`);
           socket.emit('error', { message: 'You must be added to this ticket by an admin to access it' });
           return;
@@ -133,7 +193,7 @@ export const setupChatHandlers = (io) => {
 
         // Join the ticket room
         socket.join(`ticket:${ticketId}`);
-        console.log(`✅ User ${socket.user.email} joined ticket ${ticketId}`);
+        console.log(`✅ User ${socket.user.email} joined ticket ${ticketId} [CACHED]`);
 
         // Notify others in the ticket
         socket.to(`ticket:${ticketId}`).emit('user_joined', {
@@ -188,42 +248,17 @@ export const setupChatHandlers = (io) => {
 
         console.log(`🎯 send_message attempt: userId=${socket.user.id}, ticketId=${ticketId}, role=${socket.user.role}, messageMode=${messageMode}`);
 
-        // Check membership first (same logic as join_ticket)
-        let isMember = false;
-        let membership = null;
+        // ⚡ OPTIMIZED: Use cached membership check instead of multiple DB queries
+        const membershipResult = await getCachedMembership(ticketId, socket.user.id, socket.user.role);
 
         if (socket.user.role === 'client') {
-          const { data: ticket } = await supabaseAdmin
-            .from('tickets')
-            .select('created_by')
-            .eq('id', ticketId)
-            .single();
-
-          // Client is member if they created ticket
-          if (ticket && ticket.created_by === socket.user.id) {
-            isMember = true;
-          } else {
-            // Or if they're in ticket_members
-            const { data: memberRecord } = await supabaseAdmin
-              .from('ticket_members')
-              .select('*')
-              .eq('ticket_id', ticketId)
-              .eq('user_id', socket.user.id)
-              .single();
-
-            if (memberRecord) {
-              isMember = true;
-              membership = memberRecord;
-            }
-          }
-
-          if (!isMember) {
+          if (!membershipResult.isMember) {
             console.log(`❌ Client not a member of ticket ${ticketId}`);
             socket.emit('error', { message: 'You are not a member of this ticket' });
             return;
           }
 
-          // ✅ ALLOW clients to send in "client" mode
+          // ✅ ALLOW clients to send in "client" mode only
           if (messageMode !== 'client') {
             socket.emit('error', {
               message: 'Clients can only send messages in client mode'
@@ -232,41 +267,16 @@ export const setupChatHandlers = (io) => {
           }
         } else {
           // Team members (admin, employee, freelancer): Check if they're in ticket_members
-          const { data: memberRecord } = await supabaseAdmin
-            .from('ticket_members')
-            .select('*, can_message_client')
-            .eq('ticket_id', ticketId)
-            .eq('user_id', socket.user.id)
-            .single();
-
-          if (!memberRecord) {
+          if (!membershipResult.isMember) {
             console.log(`❌ User ${socket.user.role} not a member of ticket ${ticketId}`);
             socket.emit('error', { message: 'You must be added to this ticket by an admin to send messages' });
             return;
           }
-
-          membership = memberRecord;
-          isMember = true;
-
           // ADMINS, EMPLOYEES, and FREELANCERS can all send in both client and internal mode if added as member
-          // No additional restrictions for freelancers once they are added to the ticket
         }
 
-        // Log what we're about to save
-        console.log('💾 About to save message to DB:', {
-          ticketId,
-          senderId: socket.user.id,
-          message,
-          messageType,
-          messageMode,
-          fileUrl,
-          replyToId,
-          fileName,
-          fileSize,
-          fileMimeType,
-          fileUrlType: typeof fileUrl,
-          fileUrlLength: fileUrl?.length
-        });
+        // Log what we're about to save (reduced logging for performance)
+        console.log('💾 Saving message to DB [OPTIMIZED]');
 
         // Save message to database with message_mode and reply support
         const { data: newMessage, error } = await supabaseAdmin
@@ -287,56 +297,27 @@ export const setupChatHandlers = (io) => {
           .select('*')
           .single();
 
-        // Log what we got back from the database
-        console.log('💾 Message saved to DB:', {
-          messageId: newMessage?.id,
-          storedFileUrl: newMessage?.file_url,
-          storedFileUrlType: typeof newMessage?.file_url,
-          storedFileUrlLength: newMessage?.file_url?.length
-        });
-
         if (error) {
           console.error('Error saving message:', error);
           socket.emit('error', { message: 'Failed to send message' });
           return;
         }
 
-        // Fetch sender details
-        const { data: sender } = await supabaseAdmin
-          .from('users')
-          .select('id, email, name, profile_picture, role')
-          .eq('id', socket.user.id)
-          .single();
+        // ⚡ OPTIMIZED: Use cached user profile instead of DB fetch
+        const sender = await getCachedUserProfile(socket.user.id);
 
         // Fetch reply-to message if exists
         let replyToMessage = null;
         if (replyToId) {
-          console.log('🔔 Backend: Fetching reply-to message with ID:', replyToId);
-
           const { data: replyMsg, error: replyError } = await supabaseAdmin
             .from('ticket_messages')
             .select('id, sender_id, message, message_type, file_name, is_deleted, created_at')
             .eq('id', replyToId)
             .single();
 
-          if (replyError) {
-            console.error('❌ Backend: Error fetching reply message:', replyError);
-          }
-
           if (!replyError && replyMsg) {
-            console.log('✅ Backend: Found reply message:', {
-              id: replyMsg.id,
-              sender_id: replyMsg.sender_id,
-              message_preview: replyMsg.message?.substring(0, 50),
-              is_deleted: replyMsg.is_deleted
-            });
-
-            // Fetch reply message sender
-            const { data: replySender } = await supabaseAdmin
-              .from('users')
-              .select('id, name')
-              .eq('id', replyMsg.sender_id)
-              .single();
+            // ⚡ OPTIMIZED: Use cached user profile for reply sender
+            const replySender = await getCachedUserProfile(replyMsg.sender_id);
 
             replyToMessage = {
               id: replyMsg.id,
@@ -347,29 +328,10 @@ export const setupChatHandlers = (io) => {
               file_name: replyMsg.file_name,
               created_at: replyMsg.created_at
             };
-
-            console.log('✅ Backend: Reply data prepared:', {
-              sender_name: replyToMessage.sender_name,
-              message_preview: replyToMessage.message?.substring(0, 50),
-              message_type: replyToMessage.message_type
-            });
-          } else {
-            console.log('⚠️ Backend: No reply message found for ID:', replyToId);
           }
         }
 
-        console.log('💬 Socket message - User data:', {
-          socketUserId: socket.user.id,
-          socketUserName: socket.user.name,
-          socketUserRole: socket.user.role,
-          fetchedSenderId: sender?.id,
-          fetchedSenderName: sender?.name,
-          fetchedSenderRole: sender?.role,
-          fetchedSenderEmail: sender?.email,
-          hasReply: !!replyToMessage
-        });
-
-        // Use the fetched sender data if available, otherwise fall back to socket.user
+        // Use the cached sender data if available, otherwise fall back to socket.user
         const userData = sender || {
           id: socket.user.id,
           name: socket.user.name,
@@ -377,8 +339,6 @@ export const setupChatHandlers = (io) => {
           profile_picture: socket.user.profile_picture,
           role: socket.user.role
         };
-
-        console.log('💬 Final userData being sent:', userData);
 
         const messageWithSender = {
           ...newMessage,
@@ -1227,7 +1187,6 @@ export const setupChatHandlers = (io) => {
         console.error('Error getting online users:', error);
       }
     });
-
     /**
      * Handle disconnection
      */
@@ -1255,3 +1214,6 @@ export const setupChatHandlers = (io) => {
 
   return io;
 };
+
+// Export cache invalidation for use in other modules (e.g., when members are updated via API)
+export { invalidateMembershipCache };
