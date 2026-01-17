@@ -600,80 +600,74 @@ export const getUserTickets = async (req, res) => {
       return errorResponse(res, "Failed to fetch user details", 500);
     }
 
-    let ticketsToFetch = [];
+    // OPTIMIZED QUERY: Fetch tickets with all related data using Supabase joins
+    // This replaces the previous N+1 logic where we looped through tickets to fetch specific details
 
+    let query = supabaseAdmin
+      .from("tickets")
+      .select(`
+        *,
+        created_by_user:users!created_by (id, name, email, role, profile_picture),
+        members:ticket_members (
+          role,
+          user:users (id, name, email, profile_picture, role)
+        ),
+        files:ticket_files (*)
+      `)
+      .order("created_at", { ascending: false });
+
+    // Apply role-based filtering
     if (user.role === "admin" || user.role === "employee") {
       // Admin and Employee can see ALL tickets
       console.log(`User is ${user.role} - fetching all tickets`);
-
-      const { data: allTickets, error: ticketsError } = await supabaseAdmin
-        .from("tickets")
-        .select("*")
-        .order("created_at", { ascending: false });
-
-      if (ticketsError) {
-        console.error("Error fetching tickets:", ticketsError);
-        return errorResponse(
-          res,
-          `Failed to fetch tickets: ${ticketsError.message}`,
-          500
-        );
-      }
-
-      ticketsToFetch = allTickets || [];
     } else {
-      // Non-admin/non-employee users (clients) can only see tickets they are members of
-      // Note: Clients are automatically added as members when they create tickets
-      console.log(
-        `User is ${user.role} - fetching only tickets they are members of`
-      );
+      // Clients/Users only see tickets they are members of OR created
+      console.log(`User is ${user.role} - fetching only relevant tickets`);
 
-      // Get ticket IDs where user is a member
-      const { data: memberships, error: membershipsError } = await supabaseAdmin
+      // We need to fetch tickets where:
+      // 1. created_by = userId OR
+      // 2. userId is in ticket_members
+
+      // 1. Tickets created by user
+      const { data: createdTickets } = await supabaseAdmin
+        .from("tickets")
+        .select("id")
+        .eq("created_by", userId);
+
+      // 2. Tickets where user is member
+      const { data: memberTickets } = await supabaseAdmin
         .from("ticket_members")
         .select("ticket_id")
         .eq("user_id", userId);
 
-      if (membershipsError) {
-        console.error("Error fetching memberships:", membershipsError);
-        return errorResponse(res, "Failed to fetch memberships", 500);
-      }
+      const createdIds = createdTickets?.map(t => t.id) || [];
+      const memberIds = memberTickets?.map(m => m.ticket_id) || [];
+      const allTicketIds = [...new Set([...createdIds, ...memberIds])];
 
-      console.log(
-        `📋 Client memberships found: ${memberships?.length || 0} tickets`
-      );
-
-      if (!memberships || memberships.length === 0) {
-        console.log("User is not a member of any tickets");
+      if (allTicketIds.length === 0) {
+        console.log("No tickets found for user");
         return successResponse(res, { tickets: [] }, "No tickets found");
       }
 
-      const ticketIds = memberships.map((m) => m.ticket_id);
-
-      // Fetch tickets where user is a member
-      const { data: userTickets, error: ticketsError } = await supabaseAdmin
-        .from("tickets")
-        .select("*")
-        .in("id", ticketIds)
-        .order("created_at", { ascending: false });
-
-      if (ticketsError) {
-        console.error("Error fetching tickets:", ticketsError);
-        return errorResponse(
-          res,
-          `Failed to fetch tickets: ${ticketsError.message}`,
-          500
-        );
-      }
-
-      ticketsToFetch = userTickets || [];
+      query = query.in("id", allTicketIds);
     }
 
-    // If no tickets exist, return empty array
-    if (ticketsToFetch.length === 0) {
+    const { data: tickets, error: ticketsError } = await query;
+
+    if (ticketsError) {
+      console.error("Error fetching tickets:", ticketsError);
+      return errorResponse(res, `Failed to fetch tickets: ${ticketsError.message}`, 500);
+    }
+
+    if (!tickets || tickets.length === 0) {
       console.log("No tickets found");
       return successResponse(res, { tickets: [] }, "No tickets found");
     }
+
+    console.log(`📋 Fetched ${tickets.length} tickets with details`);
+
+    // Use fetched tickets directly
+    let ticketsToFetch = tickets;
 
     // Remove any potential duplicates by ticket ID (safety check)
     const uniqueTicketsMap = new Map();
@@ -686,114 +680,105 @@ export const getUserTickets = async (req, res) => {
 
     console.log(`📋 Returning ${ticketsToFetch.length} unique tickets`);
 
-    // For each ticket, get members and files
-    const ticketsWithDetails = await Promise.all(
-      ticketsToFetch.map(async (ticket) => {
-        // Get members for this ticket
-        const { data: ticketMembers } = await supabaseAdmin
-          .from("ticket_members")
-          .select("user_id, role")
-          .eq("ticket_id", ticket.id);
+    // Transform the data to match the expected frontend structure
+    const ticketsWithDetails = await Promise.all(ticketsToFetch.map(async (ticket) => {
+      // 1. Format members
+      const validMembers = (ticket.members || [])
+        .map(m => {
+          if (!m.user) return null;
+          return {
+            ...m.user,
+            role: m.user.role // ensure role is present
+          };
+        })
+        .filter(Boolean);
 
-        // Get user details for each member (filter out deleted users)
-        const membersWithDetails = await Promise.all(
-          (ticketMembers || []).map(async (member) => {
-            const { data: memberUser } = await supabaseAdmin
-              .from("users")
-              .select("id, name, email, profile_picture, role")
-              .eq("id", member.user_id)
-              .single();
-            return memberUser; // Will be null if user is deleted
-          })
-        );
+      // 2. Format creator
+      const creator = ticket.created_by_user || {
+        id: ticket.created_by,
+        name: "Deleted User",
+        email: "deleted@user.com",
+        role: "unknown",
+        profile_picture: null,
+      };
 
-        // Filter out null values (deleted users)
-        const validMembers = membersWithDetails.filter(
-          (member) => member !== null
-        );
+      // 3. Files are already in correct format from the join
+      const ticketFiles = ticket.files || [];
 
-        // Get files for this ticket
-        const { data: ticketFiles } = await supabaseAdmin
-          .from("ticket_files")
-          .select("*")
-          .eq("ticket_id", ticket.id);
+      // 4. Get last message (Optimized)
+      // We already have members, so we know who the clients are
+      let lastMessage = null;
+      let lastMessageSender = null;
 
-        // Get creator info (handle deleted users)
-        const { data: creator } = await supabaseAdmin
-          .from("users")
-          .select("id, name, email, role, profile_picture")
-          .eq("id", ticket.created_by)
-          .single();
+      // Identify client IDs for message filtering optimization
+      const clientIds = validMembers
+        .filter(u => u.role === "client")
+        .map(u => u.id);
 
-        // If creator is deleted, use placeholder
-        const creatorInfo = creator || {
-          id: ticket.created_by,
-          name: "Deleted User",
-          email: "deleted@user.com",
-          role: "unknown",
-          profile_picture: null,
-        };
+      if (creator && creator.role === "client") {
+        clientIds.push(creator.id);
+      }
 
-        // Get the last message for this ticket from ticket_messages
-        const { data: lastMessageData, error: messageError } =
-          await supabaseAdmin
-            .from("ticket_messages")
-            .select(
-              `
+      // We can't easily join the "last message" in the main query because it requires ordering/limits per ticket
+      // But we can optimize by only querying if strictly needed or by batching in a future improvement.
+      // For now, we'll keep this single query per ticket but it's much faster than before 
+      // because we skip all the other lookups.
+
+      const { data: lastMessageData } = await supabaseAdmin
+        .from("ticket_messages")
+        .select(`
             message, 
             message_type, 
             sender_id,
             sender:users!sender_id(name)
-          `
-            )
-            .eq("ticket_id", ticket.id)
-            .order("created_at", { ascending: false })
-            .limit(1)
-            .maybeSingle();
+          `)
+        .eq("ticket_id", ticket.id)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
 
-        let lastMessage = null;
-        let lastMessageSender = null;
-
-        if (lastMessageData && !messageError) {
-          // Format message based on type
-          if (lastMessageData.message_type === "text") {
-            lastMessage = lastMessageData.message;
-          } else if (lastMessageData.message_type === "file") {
-            lastMessage = "📎 Sent a file";
-          } else if (lastMessageData.message_type === "image") {
-            lastMessage = "🖼️ Sent an image";
-          }
-          lastMessageSender = lastMessageData.sender?.name || "Unknown";
+      if (lastMessageData) {
+        if (lastMessageData.message_type === "text") {
+          lastMessage = lastMessageData.message;
+        } else if (lastMessageData.message_type === "file") {
+          lastMessage = "📎 Sent a file";
+        } else if (lastMessageData.message_type === "image") {
+          lastMessage = "🖼️ Sent an image";
         }
+        lastMessageSender = lastMessageData.sender?.name || "Unknown";
+      }
 
-        // Check if ticket is starred by current user
-        const { data: starredData } = await supabaseAdmin
-          .from("starred_tickets")
-          .select("*")
-          .eq("ticket_id", ticket.id)
-          .eq("user_id", userId)
-          .single();
+      // Check if ticket is starred (still needs individual check unfortunately, unless we join starred_tickets too)
+      const { data: starredData } = await supabaseAdmin
+        .from("starred_tickets")
+        .select("id")
+        .eq("ticket_id", ticket.id)
+        .eq("user_id", userId)
+        .maybeSingle();
 
-        return {
-          id: ticket.id,
-          ticketNumber: ticket.ticket_number,
-          uid: ticket.uid,
-          title: ticket.title,
-          description: ticket.description,
-          priority: ticket.priority,
-          status: ticket.status,
-          points: ticket.points || [],
-          createdBy: creatorInfo, // Use creatorInfo instead of creator
-          members: validMembers, // Use validMembers instead of membersWithDetails
-          files: ticketFiles || [],
-          createdAt: ticket.created_at,
-          updatedAt: ticket.updated_at,
-          lastMessage: lastMessage,
-          lastMessageSender: lastMessageSender,
-          isStarred: !!starredData,
-        };
-      })
-    );
+      return {
+        id: ticket.id,
+        ticketNumber: ticket.ticket_number,
+        uid: ticket.uid,
+        title: ticket.title,
+        description: ticket.description,
+        priority: ticket.priority,
+        status: ticket.status,
+        points: ticket.points || [],
+        createdBy: creator,
+        members: validMembers,
+        files: ticketFiles,
+        createdAt: ticket.created_at,
+        updatedAt: ticket.updated_at,
+        lastMessage: lastMessage,
+        lastMessageSender: lastMessageSender,
+        isStarred: !!starredData,
+        // Legacy fields for backward compatibility
+        creator_name: creator.name,
+        creator_email: creator.email,
+        payment_stages: ticket.payment_stages
+      };
+    }));
 
     console.log(
       `Found ${ticketsWithDetails.length} tickets for user (role: ${user.role})`
