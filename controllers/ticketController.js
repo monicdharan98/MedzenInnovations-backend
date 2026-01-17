@@ -4190,6 +4190,20 @@ export const exportTicketsToExcel = async (req, res) => {
           .filter(Boolean)
           .join(" | ") || "N/A";
 
+        // Get payment stages status
+        const paymentStages = ticket.payment_stages || {
+          part_a: { notified: false, completed: false },
+          statistical_results: { notified: false, completed: false },
+          part_b: { notified: false, completed: false },
+        };
+
+        const getStageStatus = (stage) => {
+          if (!stage) return "Not Notified";
+          if (stage.completed) return "Completed";
+          if (stage.notified) return "Pending";
+          return "Not Notified";
+        };
+
         return {
           createdAt: new Date(ticket.created_at).toLocaleDateString("en-IN", {
             year: "numeric",
@@ -4204,6 +4218,9 @@ export const exportTicketsToExcel = async (req, res) => {
           ticketId: ticket.uid,
           ticketLink: `${frontendUrl}/dashboard?ticketId=${ticket.id}`,
           clientLastMessage,
+          partAStatus: getStageStatus(paymentStages.part_a),
+          statsStatus: getStageStatus(paymentStages.statistical_results),
+          partBStatus: getStageStatus(paymentStages.part_b),
         };
       })
     );
@@ -4224,6 +4241,9 @@ export const exportTicketsToExcel = async (req, res) => {
       { header: "Ticket ID", key: "ticketId", width: 15 },
       { header: "Ticket Link", key: "ticketLink", width: 50 },
       { header: "Client Last Message", key: "clientLastMessage", width: 40 },
+      { header: "Part A Payment Status", key: "partAStatus", width: 22 },
+      { header: "Statistics Payment Status", key: "statsStatus", width: 25 },
+      { header: "Part B Payment Status", key: "partBStatus", width: 22 },
     ];
 
     // Style the header row
