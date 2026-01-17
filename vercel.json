@@ -1,51 +1,9 @@
 {
     "version": 2,
-    "builds": [
+    "rewrites": [
         {
-            "src": "api/**/*.js",
-            "use": "@vercel/node"
-        }
-    ],
-    "routes": [
-        {
-            "src": "/api/send-email",
-            "dest": "/api/send-email.js",
-            "methods": [
-                "POST",
-                "OPTIONS"
-            ]
-        },
-        {
-            "src": "/api/send-otp",
-            "dest": "/api/send-otp.js",
-            "methods": [
-                "POST",
-                "OPTIONS"
-            ]
-        },
-        {
-            "src": "/api/verify-otp",
-            "dest": "/api/verify-otp.js",
-            "methods": [
-                "POST",
-                "OPTIONS"
-            ]
-        },
-        {
-            "src": "/api/auth/send-otp",
-            "dest": "/api/send-otp.js",
-            "methods": [
-                "POST",
-                "OPTIONS"
-            ]
-        },
-        {
-            "src": "/api/auth/verify-otp",
-            "dest": "/api/verify-otp.js",
-            "methods": [
-                "POST",
-                "OPTIONS"
-            ]
+            "source": "/(.*)",
+            "destination": "/api/index.js"
         }
     ]
 }

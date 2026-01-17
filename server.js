@@ -195,35 +195,37 @@ app.use((req, res) => {
   });
 });
 
-// Start server
-const PORT = process.env.PORT || 5000;
-httpServer.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📡 Health check: http://localhost:${PORT}/health`);
-  console.log(`💬 Socket.IO enabled for real-time chat`);
-  console.log(`🌍 Environment: ${process.env.NODE_ENV || "development"}`);
-});
-
-// Graceful shutdown
-const gracefulShutdown = (signal) => {
-  console.log(`\n${signal} received. Starting graceful shutdown...`);
-  httpServer.close(() => {
-    console.log("✅ HTTP server closed");
-    io.close(() => {
-      console.log("✅ Socket.IO closed");
-      process.exit(0);
-    });
+// Start server only if run directly (Render/Local), not when imported (Vercel)
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  const PORT = process.env.PORT || 5000;
+  httpServer.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`📡 Health check: http://localhost:${PORT}/health`);
+    console.log(`💬 Socket.IO enabled for real-time chat`);
+    console.log(`🌍 Environment: ${process.env.NODE_ENV || "development"}`);
   });
 
-  // Force shutdown after 10 seconds
-  setTimeout(() => {
-    console.error("⚠️  Forced shutdown after timeout");
-    process.exit(1);
-  }, 10000);
-};
+  // Graceful shutdown
+  const gracefulShutdown = (signal) => {
+    console.log(`\n${signal} received. Starting graceful shutdown...`);
+    httpServer.close(() => {
+      console.log("✅ HTTP server closed");
+      io.close(() => {
+        console.log("✅ Socket.IO closed");
+        process.exit(0);
+      });
+    });
 
-process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
-process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+    // Force shutdown after 10 seconds
+    setTimeout(() => {
+      console.error("⚠️  Forced shutdown after timeout");
+      process.exit(1);
+    }, 10000);
+  };
+
+  process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+  process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+}
 
 export default app;
 export { io };
