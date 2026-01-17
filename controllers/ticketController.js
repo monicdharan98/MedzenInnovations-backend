@@ -2379,17 +2379,24 @@ export const getTicketMessages = async (req, res) => {
     // --- BATCH FETCH DATA (AGGRESSIVE PARALLEL) ---
     const senderIds = messages.map(m => m.sender_id).filter(Boolean);
     const replyMessageIds = messages.map(m => m.reply_to_message_id).filter(Boolean);
+    const forwardedMessageIds = messages.map(m => m.forwarded_from_message_id).filter(Boolean);
+    const forwardedTicketIds = messages.map(m => m.forwarded_from_ticket_id).filter(Boolean);
+    const messageIds = messages.map(m => m.id);
 
     const uniqueSenderIds = [...new Set(senderIds)];
     const uniqueReplyIds = [...new Set(replyMessageIds)];
+    const uniqueForwardedMsgIds = [...new Set(forwardedMessageIds)];
+    const uniqueForwardedTicketIds = [...new Set(forwardedTicketIds)];
 
     let usersMap = new Map();
     let repliesMap = new Map();
+    let forwardedMsgsMap = new Map();
+    let forwardedTicketsMap = new Map();
+    let seenByMap = new Map();
 
-    // Parallel processing for Senders and Replies 🚀
-    // Parallel processing for Senders and Replies 🚀
+    // ⚡ OPTIMIZED: Parallel batch fetching for ALL related data
     console.time("BatchFetch");
-    const [usersResult, repliesResult] = await Promise.all([
+    const [usersResult, repliesResult, forwardedMsgsResult, forwardedTicketsResult, seenByResult] = await Promise.all([
       // A. Fetch Senders
       uniqueSenderIds.length > 0
         ? supabaseAdmin
@@ -2403,6 +2410,27 @@ export const getTicketMessages = async (req, res) => {
           .from("ticket_messages")
           .select("id, message, message_type, sender_id, created_at, is_deleted")
           .in("id", uniqueReplyIds)
+        : { data: [] },
+      // C. Fetch Forwarded Original Messages
+      uniqueForwardedMsgIds.length > 0
+        ? supabaseAdmin
+          .from("ticket_messages")
+          .select("id, sender_id, sender:users!ticket_messages_sender_id_fkey(id, name, email, role)")
+          .in("id", uniqueForwardedMsgIds)
+        : { data: [] },
+      // D. Fetch Forwarded Source Tickets
+      uniqueForwardedTicketIds.length > 0
+        ? supabaseAdmin
+          .from("tickets")
+          .select("id, ticket_number, title")
+          .in("id", uniqueForwardedTicketIds)
+        : { data: [] },
+      // E. Fetch ALL seen_by records for all messages in one query
+      messageIds.length > 0
+        ? supabaseAdmin
+          .from('message_seen_by')
+          .select('message_id, user_id, seen_at, users!message_seen_by_user_id_fkey(id, name, email, role, profile_picture)')
+          .in('message_id', messageIds)
         : { data: [] }
     ]);
     console.timeEnd("BatchFetch");
@@ -2412,12 +2440,11 @@ export const getTicketMessages = async (req, res) => {
       usersResult.data.forEach(u => usersMap.set(u.id, u));
     }
 
-    // Process Replies & Missing Senders
+    // Process Replies & get missing senders
     if (repliesResult.data) {
       const replies = repliesResult.data;
       replies.forEach(r => repliesMap.set(r.id, r));
 
-      // Also need to know senders of replies if not already fetched
       const replySenderIds = replies.map(r => r.sender_id).filter(Boolean);
       const missingSenderIds = replySenderIds.filter(id => !usersMap.has(id));
 
@@ -2433,95 +2460,91 @@ export const getTicketMessages = async (req, res) => {
       }
     }
 
-    // Transform messages to match frontend structure
-    const messagesWithSender = await Promise.all(
-      (messages || []).map(async (message) => {
-        // 1. Format sender (from map)
-        const userData = usersMap.get(message.sender_id) || {
-          id: message.sender_id,
-          name: "Unknown User",
-          email: "",
-          profile_picture: null,
-          role: "unknown"
-        };
+    // Process Forwarded Messages
+    if (forwardedMsgsResult.data) {
+      forwardedMsgsResult.data.forEach(m => forwardedMsgsMap.set(m.id, m));
+    }
 
-        // 2. Format reply (from map)
-        let replyToMessage = null;
-        if (message.reply_to_message_id) {
-          const reply = repliesMap.get(message.reply_to_message_id);
-          if (reply) {
-            const replySender = usersMap.get(reply.sender_id) || { name: 'Unknown' };
+    // Process Forwarded Tickets
+    if (forwardedTicketsResult.data) {
+      forwardedTicketsResult.data.forEach(t => forwardedTicketsMap.set(t.id, t));
+    }
 
-            replyToMessage = {
-              id: reply.id,
-              sender_id: reply.sender_id,
-              sender_name: replySender.name,
-              message: reply.is_deleted ? "Message deleted" : (reply.message_type === 'text' ? reply.message : (reply.message_type === 'image' ? 'Image' : 'File')),
-              message_type: reply.message_type,
-              created_at: reply.created_at
-            };
-          }
+    // Process SeenBy - group by message_id
+    if (seenByResult.data) {
+      seenByResult.data.forEach(record => {
+        if (!seenByMap.has(record.message_id)) {
+          seenByMap.set(record.message_id, []);
         }
+        seenByMap.get(record.message_id).push({
+          userId: record.user_id,
+          userName: record.users?.name || 'Unknown',
+          userRole: record.users?.role,
+          profilePicture: record.users?.profile_picture,
+          seenAt: record.seen_at
+        });
+      });
+    }
 
-        // 3. Forwarded messages (Keep existing logic for now as it's complex to join deeply)
-        let forwardedFrom = null;
-        if (
-          message.forwarded_from_message_id &&
-          message.forwarded_from_ticket_id
-        ) {
-          // Keep existing manual fetch for forwarded messages for safety
-          // (Can be optimized later if needed)
-          const { data: sourceTicket } = await supabaseAdmin
-            .from("tickets")
-            .select("id, ticket_number, title")
-            .eq("id", message.forwarded_from_ticket_id)
-            .single();
+    // ⚡ OPTIMIZED: Transform messages WITHOUT additional DB calls
+    const messagesWithSender = messages.map((message) => {
+      // 1. Format sender (from map)
+      const userData = usersMap.get(message.sender_id) || {
+        id: message.sender_id,
+        name: "Unknown User",
+        email: "",
+        profile_picture: null,
+        role: "unknown"
+      };
 
-          const { data: originalMessage } = await supabaseAdmin
-            .from("ticket_messages")
-            .select("id, sender_id, sender:users!ticket_messages_sender_id_fkey(id, name, email, role)")
-            .eq("id", message.forwarded_from_message_id)
-            .single();
+      // 2. Format reply (from map)
+      let replyToMessage = null;
+      if (message.reply_to_message_id) {
+        const reply = repliesMap.get(message.reply_to_message_id);
+        if (reply) {
+          const replySender = usersMap.get(reply.sender_id) || { name: 'Unknown' };
 
-          if (sourceTicket && originalMessage) {
-            forwardedFrom = {
-              ticketId: sourceTicket.id,
-              ticketNumber: sourceTicket.ticket_number,
-              ticketTitle: sourceTicket.title,
-              originalSender: originalMessage.sender,
-            };
-          }
+          replyToMessage = {
+            id: reply.id,
+            sender_id: reply.sender_id,
+            sender_name: replySender.name,
+            message: reply.is_deleted ? "Message deleted" : (reply.message_type === 'text' ? reply.message : (reply.message_type === 'image' ? 'Image' : 'File')),
+            message_type: reply.message_type,
+            created_at: reply.created_at
+          };
         }
+      }
 
-        // 4. Seen By (Keep existing logic)
-        let seenBy = [];
-        const { data: seenRecords, error: seenError } = await supabaseAdmin
-          .from('message_seen_by')
-          .select('user_id, seen_at, users!message_seen_by_user_id_fkey(id, name, email, role, profile_picture)')
-          .eq('message_id', message.id);
+      // 3. Format forwarded info (from maps - NO DB CALL)
+      let forwardedFrom = null;
+      if (message.forwarded_from_message_id && message.forwarded_from_ticket_id) {
+        const sourceTicket = forwardedTicketsMap.get(message.forwarded_from_ticket_id);
+        const originalMessage = forwardedMsgsMap.get(message.forwarded_from_message_id);
 
-        if (!seenError && seenRecords) {
-          seenBy = seenRecords.map(record => ({
-            userId: record.user_id,
-            userName: record.users?.name || 'Unknown',
-            userRole: record.users?.role,
-            profilePicture: record.users?.profile_picture,
-            seenAt: record.seen_at
-          }));
+        if (sourceTicket && originalMessage) {
+          forwardedFrom = {
+            ticketId: sourceTicket.id,
+            ticketNumber: sourceTicket.ticket_number,
+            ticketTitle: sourceTicket.title,
+            originalSender: originalMessage.sender,
+          };
         }
+      }
 
-        return {
-          ...message,
-          sender: userData,
-          user: userData,
-          reply_to: replyToMessage,
-          forwarded_from: forwardedFrom,
-          forwardedFrom: forwardedFrom,
-          isForwarded: !!forwardedFrom,
-          seen_by: seenBy
-        };
-      })
-    );
+      // 4. Get seenBy from map (NO DB CALL)
+      const seenBy = seenByMap.get(message.id) || [];
+
+      return {
+        ...message,
+        sender: userData,
+        user: userData,
+        reply_to: replyToMessage,
+        forwarded_from: forwardedFrom,
+        forwardedFrom: forwardedFrom,
+        isForwarded: !!forwardedFrom,
+        seen_by: seenBy
+      };
+    });
 
     return successResponse(
       res,
