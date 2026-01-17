@@ -7,22 +7,22 @@ import jwt from "jsonwebtoken";
 import { supabaseAdmin } from "../config/supabase.js";
 
 /**
- * Generate access token (short-lived)
+ * Generate access token (long-lived for better UX)
  * @param {Object} payload - User data to include in token
- * @param {string} expiresIn - Token expiration time (default: 15m)
+ * @param {string} expiresIn - Token expiration time (default: 90d)
  * @returns {string} JWT access token
  */
-export const generateAccessToken = (payload, expiresIn = "24h") => {
+export const generateAccessToken = (payload, expiresIn = "90d") => {
   return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn });
 };
 
 /**
  * Generate refresh token (long-lived)
  * @param {Object} payload - User data to include in token
- * @param {string} expiresIn - Token expiration time (default: 30d)
+ * @param {string} expiresIn - Token expiration time (default: 180d)
  * @returns {string} JWT refresh token
  */
-export const generateRefreshToken = (payload, expiresIn = "30d") => {
+export const generateRefreshToken = (payload, expiresIn = "180d") => {
   return jwt.sign(
     payload,
     process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET,
@@ -44,18 +44,18 @@ export const generateTokenPair = (user, rememberMe = false) => {
     name: user.name,
   };
 
-  // Access token - 24 hours for better UX
-  const accessToken = generateAccessToken(payload, "24h");
+  // Access token - 90 days for better UX (users stay logged in)
+  const accessToken = generateAccessToken(payload, "90d");
 
   // Refresh token - longer lived, extended if "remember me"
-  const refreshTokenExpiry = rememberMe ? "90d" : "30d";
+  const refreshTokenExpiry = rememberMe ? "365d" : "180d";
   const refreshToken = generateRefreshToken(payload, refreshTokenExpiry);
 
   return {
     accessToken,
     refreshToken,
-    expiresIn: 24 * 60 * 60, // 24 hours in seconds
-    refreshExpiresIn: rememberMe ? 90 * 24 * 60 * 60 : 30 * 24 * 60 * 60, // in seconds
+    expiresIn: 90 * 24 * 60 * 60, // 90 days in seconds
+    refreshExpiresIn: rememberMe ? 365 * 24 * 60 * 60 : 180 * 24 * 60 * 60, // in seconds
   };
 };
 
