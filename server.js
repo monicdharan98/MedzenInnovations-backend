@@ -123,14 +123,19 @@ const io = new Server(httpServer, {
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   },
   // Improved settings for Render and unstable connections
-  pingTimeout: 60000,
-  pingInterval: 25000,
+  pingTimeout: 30000, // 30 seconds (Fail fast & reconnect)
+  pingInterval: 15000, // 15 seconds (Keep connection active through LB)
   upgradeTimeout: 30000,
   maxHttpBufferSize: 1e8,
   transports: ["websocket", "polling"],
   allowUpgrades: true,
   perMessageDeflate: false,
   httpCompression: false,
+  // Enable connection state recovery (Client gets missed messages upon reconnection)
+  connectionStateRecovery: {
+    maxDisconnectionDuration: 2 * 60 * 1000, // 2 minutes
+    skipMiddlewares: true,
+  },
 });
 
 // Middleware
