@@ -123,8 +123,9 @@ const io = new Server(httpServer, {
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   },
   // Improved settings for Render and unstable connections
-  pingTimeout: 30000, // 30 seconds (Fail fast & reconnect)
-  pingInterval: 15000, // 15 seconds (Keep connection active through LB)
+  // Standard Socket.IO settings (Reverted 502 Fix Check)
+  pingTimeout: 60000,
+  pingInterval: 25000,
   upgradeTimeout: 30000,
   maxHttpBufferSize: 1e8,
   transports: ["websocket", "polling"],

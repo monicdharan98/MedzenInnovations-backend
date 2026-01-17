@@ -654,47 +654,38 @@ export const getUserTickets = async (req, res) => {
 
     console.log(`📋 Fetched ${tickets.length} tickets - starting batch data load`);
 
-    // --- BATCH FETCH STEPS (AGGRESSIVE PARALLEL) ---
-    // 1. Get all Ticket IDs
+    // --- BATCH FETCH STEPS (SAFE BATCHED PARALLEL) ---
+    // Process in chunks to prevent memory spikes / connection exhaustion
     const ticketIds = tickets.map(t => t.id);
+    const BATCH_SIZE = 50; // Fetch 50 tickets' details at a time
 
-    // 2. Parallel Fetch Level 1: Fetch Members, Files, Starred, and Messages simultaneously 🚀
-    const [
-      membersResult,
-      filesResult,
-      starredResult,
-      recentMessagesResult
-    ] = await Promise.all([
-      // A. Members
-      supabaseAdmin
-        .from("ticket_members")
-        .select("ticket_id, user_id, role")
-        .in("ticket_id", ticketIds),
-      // B. Files
-      supabaseAdmin
-        .from("ticket_files")
-        .select("*")
-        .in("ticket_id", ticketIds),
-      // C. Starred Status
-      supabaseAdmin
-        .from("starred_tickets")
-        .select("ticket_id")
-        .eq("user_id", userId)
-        .in("ticket_id", ticketIds),
-      // D. Recent Messages (Heuristic Batch)
-      supabaseAdmin
-        .from("ticket_messages")
-        .select("ticket_id, message, message_type, created_at, sender_id")
-        .in("ticket_id", ticketIds)
-        .order("created_at", { ascending: false })
-        .limit(ticketIds.length * 5)
-    ]);
+    let allMembers = [];
+    let allFiles = [];
+    let starredByIds = [];
+    let recentMessages = [];
 
-    const allMembers = membersResult.data || [];
-    const allFiles = filesResult.data || [];
-    const starredByIds = (starredResult.data || []).map(s => s.ticket_id);
+    for (let i = 0; i < ticketIds.length; i += BATCH_SIZE) {
+      const chunkIds = ticketIds.slice(i, i + BATCH_SIZE);
+
+      const [chunkMembers, chunkFiles, chunkStarred, chunkMessages] = await Promise.all([
+        // A. Members
+        supabaseAdmin.from("ticket_members").select("ticket_id, user_id, role").in("ticket_id", chunkIds),
+        // B. Files
+        supabaseAdmin.from("ticket_files").select("*").in("ticket_id", chunkIds),
+        // C. Starred
+        supabaseAdmin.from("starred_tickets").select("ticket_id").eq("user_id", userId).in("ticket_id", chunkIds),
+        // D. Recent Messages
+        supabaseAdmin.from("ticket_messages").select("ticket_id, message, message_type, created_at, sender_id")
+          .in("ticket_id", chunkIds).order("created_at", { ascending: false }).limit(chunkIds.length * 5)
+      ]);
+
+      if (chunkMembers.data) allMembers.push(...chunkMembers.data);
+      if (chunkFiles.data) allFiles.push(...chunkFiles.data);
+      if (chunkStarred.data) starredByIds.push(...chunkStarred.data.map(s => s.ticket_id));
+      if (chunkMessages.data) recentMessages.push(...chunkMessages.data);
+    }
+
     const starredSet = new Set(starredByIds);
-    const recentMessages = recentMessagesResult.data || [];
 
     // 3. Process Messages & Identify Fallbacks
     let lastMessagesMap = new Map();
@@ -2331,7 +2322,10 @@ export const getTicketMessages = async (req, res) => {
       query = query.lt("created_at", before);
     }
 
+    // --- PERFORMANCE LOG ---
+    console.time("FetchMessagesQuery");
     const { data: messages, error } = await query;
+    console.timeEnd("FetchMessagesQuery");
 
     if (error) {
       console.error("❌ Error fetching messages:", error);
@@ -2376,6 +2370,8 @@ export const getTicketMessages = async (req, res) => {
     let repliesMap = new Map();
 
     // Parallel processing for Senders and Replies 🚀
+    // Parallel processing for Senders and Replies 🚀
+    console.time("BatchFetch");
     const [usersResult, repliesResult] = await Promise.all([
       // A. Fetch Senders
       uniqueSenderIds.length > 0
@@ -2392,6 +2388,7 @@ export const getTicketMessages = async (req, res) => {
           .in("id", uniqueReplyIds)
         : { data: [] }
     ]);
+    console.timeEnd("BatchFetch");
 
     // Process Users
     if (usersResult.data) {
