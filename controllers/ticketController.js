@@ -654,32 +654,97 @@ export const getUserTickets = async (req, res) => {
 
     console.log(`📋 Fetched ${tickets.length} tickets - starting batch data load`);
 
-    // --- BATCH FETCH STEPS ---
-
+    // --- BATCH FETCH STEPS (AGGRESSIVE PARALLEL) ---
     // 1. Get all Ticket IDs
     const ticketIds = tickets.map(t => t.id);
 
-    // 2. Fetch all Members and Files for these tickets in parallel
-    const [membersResult, filesResult] = await Promise.all([
+    // 2. Parallel Fetch Level 1: Fetch Members, Files, Starred, and Messages simultaneously 🚀
+    const [
+      membersResult,
+      filesResult,
+      starredResult,
+      recentMessagesResult
+    ] = await Promise.all([
+      // A. Members
       supabaseAdmin
         .from("ticket_members")
         .select("ticket_id, user_id, role")
         .in("ticket_id", ticketIds),
+      // B. Files
       supabaseAdmin
         .from("ticket_files")
         .select("*")
+        .in("ticket_id", ticketIds),
+      // C. Starred Status
+      supabaseAdmin
+        .from("starred_tickets")
+        .select("ticket_id")
+        .eq("user_id", userId)
+        .in("ticket_id", ticketIds),
+      // D. Recent Messages (Heuristic Batch)
+      supabaseAdmin
+        .from("ticket_messages")
+        .select("ticket_id, message, message_type, created_at, sender_id")
         .in("ticket_id", ticketIds)
+        .order("created_at", { ascending: false })
+        .limit(ticketIds.length * 5)
     ]);
 
     const allMembers = membersResult.data || [];
     const allFiles = filesResult.data || [];
+    const starredByIds = (starredResult.data || []).map(s => s.ticket_id);
+    const starredSet = new Set(starredByIds);
+    const recentMessages = recentMessagesResult.data || [];
 
-    // 3. Collect unique User IDs (Creators + Members)
-    const creatorIds = tickets.map(t => t.created_by).filter(Boolean);
-    const memberUserIds = allMembers.map(m => m.user_id).filter(Boolean);
-    const uniqueUserIds = [...new Set([...creatorIds, ...memberUserIds])];
+    // 3. Process Messages & Identify Fallbacks
+    let lastMessagesMap = new Map();
+    let ticketsNeedingFallback = new Set(ticketIds);
 
-    // 4. Batch fetch all Users
+    if (recentMessages.length > 0) {
+      for (const msg of recentMessages) {
+        if (!lastMessagesMap.has(msg.ticket_id)) {
+          lastMessagesMap.set(msg.ticket_id, msg);
+          ticketsNeedingFallback.delete(msg.ticket_id);
+        }
+      }
+    }
+
+    // 4. Fallback Fetch for inactive tickets (Rare)
+    // We do this BEFORE fetching users so we can include fallback senders in the user batch
+    // 4. Fallback Fetch for inactive tickets
+    // Process in Chunks to avoid Connection Pool Exhaustion / OOM
+    if (ticketsNeedingFallback.size > 0) {
+      const fallbackIds = Array.from(ticketsNeedingFallback);
+      const BATCH_SIZE = 50;
+
+      for (let i = 0; i < fallbackIds.length; i += BATCH_SIZE) {
+        const chunk = fallbackIds.slice(i, i + BATCH_SIZE);
+
+        const batchPromises = chunk.map(async (missingTicketId) => {
+          const { data: fallbackMsg } = await supabaseAdmin
+            .from("ticket_messages")
+            .select("ticket_id, message, message_type, created_at, sender_id")
+            .eq("ticket_id", missingTicketId)
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle();
+
+          if (fallbackMsg) {
+            lastMessagesMap.set(missingTicketId, fallbackMsg);
+          }
+        });
+
+        await Promise.all(batchPromises); // Wait for this batch before starting next
+      }
+    }
+
+    // 5. Consolidated User Fetch: Creators + Members + Message Senders
+    const creatorIds = tickets.map(t => t.created_by);
+    const memberUserIds = allMembers.map(m => m.user_id);
+    const messageSenderIds = Array.from(lastMessagesMap.values()).map(m => m.sender_id);
+
+    const uniqueUserIds = [...new Set([...creatorIds, ...memberUserIds, ...messageSenderIds])].filter(Boolean);
+
     let usersMap = new Map();
     if (uniqueUserIds.length > 0) {
       const { data: users } = await supabaseAdmin
@@ -692,98 +757,7 @@ export const getUserTickets = async (req, res) => {
       }
     }
 
-    // 6. Check "Starred" status
-    const { data: starredTickets } = await supabaseAdmin
-      .from("starred_tickets")
-      .select("ticket_id")
-      .eq("user_id", userId)
-      .in("ticket_id", ticketIds);
 
-    const starredSet = new Set(starredTickets?.map(s => s.ticket_id) || []);
-
-    // --- OPTIMIZED LAST MESSAGE FETCH (Heuristic Batch) ---
-    // Step A: Fetch recent messages for ALL these tickets in one go
-    // We fetch (N * 5) messages to likely cover the last message of every active ticket
-    const batchLimit = ticketIds.length * 5;
-    let lastMessagesMap = new Map();
-    let ticketsNeedingFallback = new Set(ticketIds);
-
-    if (ticketIds.length > 0) {
-      const { data: recentMessages } = await supabaseAdmin
-        .from("ticket_messages")
-        .select(`
-            ticket_id,
-            message, 
-            message_type, 
-            created_at,
-            sender_id
-        `)
-        .in("ticket_id", ticketIds)
-        .order("created_at", { ascending: false })
-        .limit(batchLimit);
-
-      if (recentMessages) {
-        // Process from newest to oldest
-        for (const msg of recentMessages) {
-          // Since it's ordered by DESC, the first time we see a ticket_id, it is the latest message
-          if (!lastMessagesMap.has(msg.ticket_id)) {
-            lastMessagesMap.set(msg.ticket_id, msg);
-            ticketsNeedingFallback.delete(msg.ticket_id);
-          }
-        }
-      }
-    }
-
-    // Step B: Collect Sender IDs for the batch messages to fetch names
-    // (Optimization: reuse checks from usersMap)
-    const batchSenderIds = Array.from(lastMessagesMap.values()).map(m => m.sender_id);
-    const missingBatchSenderIds = batchSenderIds.filter(id => !usersMap.has(id));
-
-    if (missingBatchSenderIds.length > 0) {
-      const { data: interactionSenders } = await supabaseAdmin
-        .from("users")
-        .select("id, name")
-        .in("id", [...new Set(missingBatchSenderIds)]);
-
-      if (interactionSenders) {
-        interactionSenders.forEach(u => usersMap.set(u.id, u));
-      }
-    }
-
-    // Step C: Fallback for inactive tickets (N+1 but only for tickets NOT in top N*5 recent messages)
-    // These are usually old/inactive tickets where latency matters less, or few in number
-    const fallbackPromises = Array.from(ticketsNeedingFallback).map(async (missingTicketId) => {
-      const { data: fallbackMsg } = await supabaseAdmin
-        .from("ticket_messages")
-        .select(`
-              ticket_id,
-              message, 
-              message_type, 
-              created_at,
-              sender_id
-          `)
-        .eq("ticket_id", missingTicketId)
-        .order("created_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      if (fallbackMsg) {
-        lastMessagesMap.set(missingTicketId, fallbackMsg);
-        if (!usersMap.has(fallbackMsg.sender_id)) {
-          // Quick lookup for fallback sender
-          const { data: fs } = await supabaseAdmin
-            .from("users")
-            .select("id, name")
-            .eq("id", fallbackMsg.sender_id)
-            .single();
-          if (fs) usersMap.set(fs.id, fs);
-        }
-      }
-    });
-
-    if (fallbackPromises.length > 0) {
-      await Promise.all(fallbackPromises);
-    }
 
     // 7. Map everything back
     const ticketsWithDetails = await Promise.all(tickets.map(async (ticket) => {
@@ -2391,50 +2365,57 @@ export const getTicketMessages = async (req, res) => {
       return successResponse(res, { messages: [] }, "No messages found");
     }
 
-    // --- BATCH FETCH DATA ---
+    // --- BATCH FETCH DATA (AGGRESSIVE PARALLEL) ---
     const senderIds = messages.map(m => m.sender_id).filter(Boolean);
     const replyMessageIds = messages.map(m => m.reply_to_message_id).filter(Boolean);
 
-    // Batch 1: Fetch all Senders
-    let usersMap = new Map();
-    if (senderIds.length > 0) {
-      const uniqueSenderIds = [...new Set(senderIds)];
-      const { data: users } = await supabaseAdmin
-        .from("users")
-        .select("id, email, name, profile_picture, role")
-        .in("id", uniqueSenderIds);
+    const uniqueSenderIds = [...new Set(senderIds)];
+    const uniqueReplyIds = [...new Set(replyMessageIds)];
 
-      if (users) {
-        users.forEach(u => usersMap.set(u.id, u));
-      }
+    let usersMap = new Map();
+    let repliesMap = new Map();
+
+    // Parallel processing for Senders and Replies 🚀
+    const [usersResult, repliesResult] = await Promise.all([
+      // A. Fetch Senders
+      uniqueSenderIds.length > 0
+        ? supabaseAdmin
+          .from("users")
+          .select("id, email, name, profile_picture, role")
+          .in("id", uniqueSenderIds)
+        : { data: [] },
+      // B. Fetch Replies
+      uniqueReplyIds.length > 0
+        ? supabaseAdmin
+          .from("ticket_messages")
+          .select("id, message, message_type, sender_id, created_at, is_deleted")
+          .in("id", uniqueReplyIds)
+        : { data: [] }
+    ]);
+
+    // Process Users
+    if (usersResult.data) {
+      usersResult.data.forEach(u => usersMap.set(u.id, u));
     }
 
-    // Batch 2: Fetch all Replied Messages
-    let repliesMap = new Map();
-    if (replyMessageIds.length > 0) {
-      const uniqueReplyIds = [...new Set(replyMessageIds)];
-      const { data: replies } = await supabaseAdmin
-        .from("ticket_messages")
-        .select("id, message, message_type, sender_id, created_at, is_deleted")
-        .in("id", uniqueReplyIds);
+    // Process Replies & Missing Senders
+    if (repliesResult.data) {
+      const replies = repliesResult.data;
+      replies.forEach(r => repliesMap.set(r.id, r));
 
-      if (replies) {
-        // Also need to know senders of replies
-        const replySenderIds = replies.map(r => r.sender_id).filter(Boolean);
-        const missingSenderIds = replySenderIds.filter(id => !usersMap.has(id));
+      // Also need to know senders of replies if not already fetched
+      const replySenderIds = replies.map(r => r.sender_id).filter(Boolean);
+      const missingSenderIds = replySenderIds.filter(id => !usersMap.has(id));
 
-        if (missingSenderIds.length > 0) {
-          const { data: replySenders } = await supabaseAdmin
-            .from("users")
-            .select("id, name")
-            .in("id", [...new Set(missingSenderIds)]);
+      if (missingSenderIds.length > 0) {
+        const { data: replySenders } = await supabaseAdmin
+          .from("users")
+          .select("id, name")
+          .in("id", [...new Set(missingSenderIds)]);
 
-          if (replySenders) {
-            replySenders.forEach(u => usersMap.set(u.id, u));
-          }
+        if (replySenders) {
+          replySenders.forEach(u => usersMap.set(u.id, u));
         }
-
-        replies.forEach(r => repliesMap.set(r.id, r));
       }
     }
 
