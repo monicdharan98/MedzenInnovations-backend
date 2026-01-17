@@ -657,12 +657,16 @@ export const getUserTickets = async (req, res) => {
     // --- BATCH FETCH STEPS (SAFE BATCHED PARALLEL) ---
     // Process in chunks to prevent memory spikes / connection exhaustion
     const ticketIds = tickets.map(t => t.id);
-    const BATCH_SIZE = 50; // Fetch 50 tickets' details at a time
+    const BATCH_SIZE = 50;
 
     let allMembers = [];
     let allFiles = [];
     let starredByIds = [];
     let recentMessages = [];
+
+    // Global User Map for this request (Incremental Load)
+    let usersMap = new Map();
+    let lastMessagesMap = new Map();
 
     for (let i = 0; i < ticketIds.length; i += BATCH_SIZE) {
       const chunkIds = ticketIds.slice(i, i + BATCH_SIZE);
@@ -679,34 +683,56 @@ export const getUserTickets = async (req, res) => {
           .in("ticket_id", chunkIds).order("created_at", { ascending: false }).limit(chunkIds.length * 5)
       ]);
 
+      // Accumulate Data
       if (chunkMembers.data) allMembers.push(...chunkMembers.data);
       if (chunkFiles.data) allFiles.push(...chunkFiles.data);
       if (chunkStarred.data) starredByIds.push(...chunkStarred.data.map(s => s.ticket_id));
       if (chunkMessages.data) recentMessages.push(...chunkMessages.data);
-    }
 
-    const starredSet = new Set(starredByIds);
+      // --- INCREMENTAL USER FETCH (Fix 502 URL Overflow) ---
+      // Identify users needed for THIS chunk
+      const chunkTickets = tickets.filter(t => chunkIds.includes(t.id));
+      const chunkCreatorIds = chunkTickets.map(t => t.created_by);
+      const chunkMemberUserIds = (chunkMembers.data || []).map(m => m.user_id);
+      const chunkMessageSenderIds = (chunkMessages.data || []).map(m => m.sender_id);
 
-    // 3. Process Messages & Identify Fallbacks
-    let lastMessagesMap = new Map();
-    let ticketsNeedingFallback = new Set(ticketIds);
+      const neededUserIds = [...new Set([...chunkCreatorIds, ...chunkMemberUserIds, ...chunkMessageSenderIds])].filter(Boolean);
+      const missingUserIds = neededUserIds.filter(id => !usersMap.has(id));
 
-    if (recentMessages.length > 0) {
-      for (const msg of recentMessages) {
-        if (!lastMessagesMap.has(msg.ticket_id)) {
-          lastMessagesMap.set(msg.ticket_id, msg);
-          ticketsNeedingFallback.delete(msg.ticket_id);
+      if (missingUserIds.length > 0) {
+        const { data: fetchedUsers } = await supabaseAdmin
+          .from("users")
+          .select("id, name, email, role, profile_picture")
+          .in("id", missingUserIds);
+
+        if (fetchedUsers) {
+          fetchedUsers.forEach(u => usersMap.set(u.id, u));
+        }
+      }
+
+      // Fill lastMessagesMap for this chunk
+      if (chunkMessages.data) {
+        for (const msg of chunkMessages.data) {
+          if (!lastMessagesMap.has(msg.ticket_id)) {
+            lastMessagesMap.set(msg.ticket_id, msg);
+          }
         }
       }
     }
 
-    // 4. Fallback Fetch for inactive tickets (Rare)
-    // We do this BEFORE fetching users so we can include fallback senders in the user batch
+    const starredSet = new Set(starredByIds);
+
+    // 3. Messages processed in loop ^^^
+
     // 4. Fallback Fetch for inactive tickets
-    // Process in Chunks to avoid Connection Pool Exhaustion / OOM
+    // Calculate needing fallback
+    let ticketsNeedingFallback = new Set(ticketIds);
+    for (const [tid] of lastMessagesMap) {
+      ticketsNeedingFallback.delete(tid);
+    }
+
     if (ticketsNeedingFallback.size > 0) {
       const fallbackIds = Array.from(ticketsNeedingFallback);
-      const BATCH_SIZE = 50;
 
       for (let i = 0; i < fallbackIds.length; i += BATCH_SIZE) {
         const chunk = fallbackIds.slice(i, i + BATCH_SIZE);
@@ -725,28 +751,19 @@ export const getUserTickets = async (req, res) => {
           }
         });
 
-        await Promise.all(batchPromises); // Wait for this batch before starting next
+        await Promise.all(batchPromises);
+      }
+
+      // Final User Fetch for Fallback Senders
+      const fallbackSenders = Array.from(ticketsNeedingFallback).map(tid => lastMessagesMap.get(tid)?.sender_id).filter(Boolean);
+      const missingFallbackSenders = fallbackSenders.filter(id => !usersMap.has(id));
+      if (missingFallbackSenders.length > 0) {
+        const { data: fetchFallbackUsers } = await supabaseAdmin.from("users").select("id, name, email, role, profile_picture").in("id", [...new Set(missingFallbackSenders)]);
+        if (fetchFallbackUsers) fetchFallbackUsers.forEach(u => usersMap.set(u.id, u));
       }
     }
 
-    // 5. Consolidated User Fetch: Creators + Members + Message Senders
-    const creatorIds = tickets.map(t => t.created_by);
-    const memberUserIds = allMembers.map(m => m.user_id);
-    const messageSenderIds = Array.from(lastMessagesMap.values()).map(m => m.sender_id);
-
-    const uniqueUserIds = [...new Set([...creatorIds, ...memberUserIds, ...messageSenderIds])].filter(Boolean);
-
-    let usersMap = new Map();
-    if (uniqueUserIds.length > 0) {
-      const { data: users } = await supabaseAdmin
-        .from("users")
-        .select("id, name, email, role, profile_picture")
-        .in("id", uniqueUserIds);
-
-      if (users) {
-        users.forEach(u => usersMap.set(u.id, u));
-      }
-    }
+    // 5. Consolidated User Fetch: REMOVED (Handled incrementally)
 
 
 
