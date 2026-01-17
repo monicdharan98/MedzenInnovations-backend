@@ -4074,10 +4074,17 @@ export const exportTicketsToExcel = async (req, res) => {
     const userRole = user.role;
     const isAdmin = userRole === "admin";
 
-    // Fetch all tickets
+    // Fetch all tickets with related data using Supabase joins
+    // This solves the N+1 problem by fetching everything in one query
     const { data: tickets, error: ticketsError } = await supabaseAdmin
       .from("tickets")
-      .select("*")
+      .select(`
+        *,
+        created_by_user:users!created_by (id, name, role),
+        members:ticket_members (
+          user:users (id, name, role, phone)
+        )
+      `)
       .order("created_at", { ascending: false });
 
     if (ticketsError) {
@@ -4095,91 +4102,67 @@ export const exportTicketsToExcel = async (req, res) => {
     // Process each ticket to get all required data
     const ticketData = await Promise.all(
       tickets.map(async (ticket) => {
-        // Get ticket creator info (usually the client)
-        const { data: creator } = await supabaseAdmin
-          .from("users")
-          .select("id, name, role")
-          .eq("id", ticket.created_by)
-          .single();
+        // Data is now pre-fetched via joins - no extra DB calls needed for basic info!
+        const creator = ticket.created_by_user;
+        const members = ticket.members || [];
 
-        // Get all members of this ticket
-        const { data: members } = await supabaseAdmin
-          .from("ticket_members")
-          .select("user_id")
-          .eq("ticket_id", ticket.id);
+        // Extract users from the members relation
+        const memberUsers = members.map(m => m.user).filter(Boolean);
 
-        // Get member details
-        const memberIds = members?.map((m) => m.user_id) || [];
         let employees = [];
         let freelancers = [];
         let clientName = "N/A";
 
-        if (memberIds.length > 0) {
-          const { data: memberUsers } = await supabaseAdmin
-            .from("users")
-            .select("id, name, role")
-            .in("id", memberIds);
+        if (memberUsers.length > 0) {
+          employees = memberUsers
+            .filter((u) => u.role === "employee")
+            .map((u) => u.name);
+          freelancers = memberUsers
+            .filter((u) => u.role === "freelancer")
+            .map((u) => u.name);
 
-          if (memberUsers) {
-            employees = memberUsers
-              .filter((u) => u.role === "employee")
-              .map((u) => u.name);
-            freelancers = memberUsers
-              .filter((u) => u.role === "freelancer")
-              .map((u) => u.name);
-
-            // Find client - either the creator or a member with client role
-            const clientMember = memberUsers.find((u) => u.role === "client");
-            if (clientMember) {
-              clientName = clientMember.name || "N/A";
-            } else if (creator && creator.role === "client") {
-              clientName = creator.name || "N/A";
-            }
+          // Find client - either the creator or a member with client role
+          const clientMember = memberUsers.find((u) => u.role === "client");
+          if (clientMember) {
+            clientName = clientMember.name || "N/A";
+          } else if (creator && creator.role === "client") {
+            clientName = creator.name || "N/A";
           }
         } else if (creator && creator.role === "client") {
           clientName = creator.name || "N/A";
         }
 
         // Get client's last message
-        // First find client IDs
-        const { data: clientsInTicket } = await supabaseAdmin
-          .from("ticket_members")
-          .select("user_id")
-          .eq("ticket_id", ticket.id);
-
+        // Optimized: We already know who the clients are, so we only query the message
         let clientLastMessage = "N/A";
 
-        if (clientsInTicket && clientsInTicket.length > 0) {
-          const clientIds = clientsInTicket.map((c) => c.user_id);
+        // Identify client IDs for this ticket
+        const clientIds = memberUsers
+          .filter(u => u.role === "client")
+          .map(u => u.id);
 
-          // Get users who are clients
-          const { data: clientUsers } = await supabaseAdmin
-            .from("users")
-            .select("id")
-            .in("id", clientIds)
-            .eq("role", "client");
+        if (creator && creator.role === "client") {
+          clientIds.push(creator.id);
+        }
 
-          if (clientUsers && clientUsers.length > 0) {
-            const clientUserIds = clientUsers.map((u) => u.id);
+        // Only query for message if we have clients involved
+        if (clientIds.length > 0) {
+          const { data: lastClientMsg } = await supabaseAdmin
+            .from("ticket_messages")
+            .select("message, message_type")
+            .eq("ticket_id", ticket.id)
+            .in("sender_id", clientIds)
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle();
 
-            // Get the last message from a client
-            const { data: lastClientMsg } = await supabaseAdmin
-              .from("ticket_messages")
-              .select("message, message_type")
-              .eq("ticket_id", ticket.id)
-              .in("sender_id", clientUserIds)
-              .order("created_at", { ascending: false })
-              .limit(1)
-              .maybeSingle();
-
-            if (lastClientMsg) {
-              if (lastClientMsg.message_type === "text") {
-                clientLastMessage = lastClientMsg.message || "N/A";
-              } else if (lastClientMsg.message_type === "file") {
-                clientLastMessage = "📎 Sent a file";
-              } else if (lastClientMsg.message_type === "image") {
-                clientLastMessage = "🖼️ Sent an image";
-              }
+          if (lastClientMsg) {
+            if (lastClientMsg.message_type === "text") {
+              clientLastMessage = lastClientMsg.message || "N/A";
+            } else if (lastClientMsg.message_type === "file") {
+              clientLastMessage = "📎 Sent a file";
+            } else if (lastClientMsg.message_type === "image") {
+              clientLastMessage = "🖼️ Sent an image";
             }
           }
         }
