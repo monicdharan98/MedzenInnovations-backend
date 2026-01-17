@@ -4070,6 +4070,10 @@ export const exportTicketsToExcel = async (req, res) => {
       return errorResponse(res, "Only admin and employees can export tickets", 403);
     }
 
+    // Store user role for conditional column display
+    const userRole = user.role;
+    const isAdmin = userRole === "admin";
+
     // Fetch all tickets
     const { data: tickets, error: ticketsError } = await supabaseAdmin
       .from("tickets")
@@ -4232,8 +4236,8 @@ export const exportTicketsToExcel = async (req, res) => {
 
     const worksheet = workbook.addWorksheet("Tickets Export");
 
-    // Define columns
-    worksheet.columns = [
+    // Define base columns (always included)
+    const baseColumns = [
       { header: "Ticket Creation Date", key: "createdAt", width: 22 },
       { header: "Client Name", key: "clientName", width: 20 },
       { header: "Employee / Freelancer Name", key: "staffNames", width: 35 },
@@ -4241,10 +4245,19 @@ export const exportTicketsToExcel = async (req, res) => {
       { header: "Ticket ID", key: "ticketId", width: 15 },
       { header: "Ticket Link", key: "ticketLink", width: 50 },
       { header: "Client Last Message", key: "clientLastMessage", width: 40 },
+    ];
+
+    // Payment columns (only for admins)
+    const paymentColumns = [
       { header: "Part A Payment Status", key: "partAStatus", width: 22 },
       { header: "Statistics Payment Status", key: "statsStatus", width: 25 },
       { header: "Part B Payment Status", key: "partBStatus", width: 22 },
     ];
+
+    // Set columns based on user role
+    worksheet.columns = isAdmin
+      ? [...baseColumns, ...paymentColumns]
+      : baseColumns;
 
     // Style the header row
     worksheet.getRow(1).font = { bold: true, size: 12 };
