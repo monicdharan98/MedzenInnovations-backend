@@ -22,23 +22,18 @@ export const setupChatHandlers = (io) => {
 
       // Verify JWT token
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      console.log('🔧 Token decoded successfully, userId:', decoded.userId);
 
-      // Get user from database
-      const { data: user, error } = await supabaseAdmin
-        .from('users')
-        .select('*')
-        .eq('id', decoded.userId)
-        .single();
+      // OPTIMIZATION: Use decoded token data instead of DB fetch to reduce latency
+      // The token contains: userId, email, role, name
+      const user = {
+        id: decoded.userId,
+        email: decoded.email,
+        role: decoded.role,
+        name: decoded.name
+      };
 
-      if (error || !user) {
-        console.error('❌ User not found for userId:', decoded.userId);
-        return next(new Error('Invalid token'));
-      }
-
-      console.log('✅ User authenticated:', {
+      console.log('✅ User authenticated (Fast Path):', {
         email: user.email,
-        name: user.name,
         role: user.role,
         id: user.id
       });
