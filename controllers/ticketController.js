@@ -586,262 +586,76 @@ export const createTicket = async (req, res) => {
 export const getUserTickets = async (req, res) => {
   try {
     const userId = req.user.id;
-    console.log("Fetching tickets for user:", userId);
 
-    // Get user role
-    const { data: user, error: userError } = await supabaseAdmin
-      .from("users")
-      .select("role")
-      .eq("id", userId)
-      .single();
-
-    if (userError) {
-      console.error("Error fetching user:", userError);
-      return errorResponse(res, "Failed to fetch user details", 500);
-    }
-
-    // OPTIMIZED QUERY STRATEGY: BATCH FETCHING
-    // 1. Fetch relevant tickets first
-    // 2. Collect all User IDs and File relationships needed
-    // 3. Batch fetch all needed users and files in parallel
-    // 4. Map data back to tickets in memory
-    // This avoids N+1 queries AND avoids "Foreign Key not found" errors with Joins
-
-    let query = supabaseAdmin
-      .from("tickets")
-      .select("*")
-      .order("created_at", { ascending: false });
-
-    // Apply role-based filtering
+    // 1. Get User Role
+    const { data: user } = await supabaseAdmin.from("users").select("role").eq("id", userId).single();
+    // 2. Determine Ticket IDs based on permissions
+    let ticketIds = [];
     if (user.role === "admin" || user.role === "employee") {
-      console.log(`User is ${user.role} - fetching all tickets`);
+      const { data } = await supabaseAdmin.from("tickets").select("id").order("created_at", { ascending: false });
+      ticketIds = data?.map(t => t.id) || [];
     } else {
-      console.log(`User is ${user.role} - fetching only relevant tickets`);
-
-      const { data: createdTickets } = await supabaseAdmin
-        .from("tickets")
-        .select("id")
-        .eq("created_by", userId);
-
-      const { data: memberTickets } = await supabaseAdmin
-        .from("ticket_members")
-        .select("ticket_id")
-        .eq("user_id", userId);
-
-      const createdIds = createdTickets?.map(t => t.id) || [];
-      const memberIds = memberTickets?.map(m => m.ticket_id) || [];
-      const allTicketIds = [...new Set([...createdIds, ...memberIds])];
-
-      if (allTicketIds.length === 0) {
-        console.log("No tickets found for user");
-        return successResponse(res, { tickets: [] }, "No tickets found");
-      }
-
-      query = query.in("id", allTicketIds);
+      const { data: created } = await supabaseAdmin.from("tickets").select("id").eq("created_by", userId);
+      const { data: memberOf } = await supabaseAdmin.from("ticket_members").select("ticket_id").eq("user_id", userId);
+      ticketIds = [...new Set([...(created?.map(t => t.id) || []), ...(memberOf?.map(m => m.ticket_id) || [])])];
     }
-
-    const { data: tickets, error: ticketsError } = await query;
-
-    if (ticketsError) {
-      console.error("Error fetching tickets:", ticketsError);
-      return errorResponse(res, `Failed to fetch tickets: ${ticketsError.message}`, 500);
-    }
-
-    if (!tickets || tickets.length === 0) {
-      console.log("No tickets found");
-      return successResponse(res, { tickets: [] }, "No tickets found");
-    }
-
-    console.log(`📋 Fetched ${tickets.length} tickets - starting batch data load`);
-
-    // --- BATCH FETCH STEPS (SAFE BATCHED PARALLEL) ---
-    // Process in chunks to prevent memory spikes / connection exhaustion
-    const ticketIds = tickets.map(t => t.id);
-    const BATCH_SIZE = 50;
-
-    let allMembers = [];
-    let allFiles = [];
-    let starredByIds = [];
-    let recentMessages = [];
-
-    // Global User Map for this request (Incremental Load)
-    let usersMap = new Map();
-    let lastMessagesMap = new Map();
-
+    if (!ticketIds.length) return successResponse(res, { tickets: [] }, "No tickets found");
+    // 3. Robust Fetch Strategy: Tickets -> Users (Avoids Ambiguous FK errors)
+    const BATCH_SIZE = 20;
+    const allTickets = [];
     for (let i = 0; i < ticketIds.length; i += BATCH_SIZE) {
       const chunkIds = ticketIds.slice(i, i + BATCH_SIZE);
 
-      const [chunkMembers, chunkFiles, chunkStarred, chunkMessages] = await Promise.all([
-        // A. Members
-        supabaseAdmin.from("ticket_members").select("ticket_id, user_id, role").in("ticket_id", chunkIds),
-        // B. Files
-        supabaseAdmin.from("ticket_files").select("*").in("ticket_id", chunkIds),
-        // C. Starred
-        supabaseAdmin.from("starred_tickets").select("ticket_id").eq("user_id", userId).in("ticket_id", chunkIds),
-        // D. Recent Messages
-        supabaseAdmin.from("ticket_messages").select("ticket_id, message, message_type, created_at, sender_id")
-          .in("ticket_id", chunkIds).order("created_at", { ascending: false }).limit(chunkIds.length * 5)
-      ]);
-
-      // Accumulate Data
-      if (chunkMembers.data) allMembers.push(...chunkMembers.data);
-      if (chunkFiles.data) allFiles.push(...chunkFiles.data);
-      if (chunkStarred.data) starredByIds.push(...chunkStarred.data.map(s => s.ticket_id));
-      if (chunkMessages.data) recentMessages.push(...chunkMessages.data);
-
-      // --- INCREMENTAL USER FETCH (Fix 502 URL Overflow) ---
-      // Identify users needed for THIS chunk
-      const chunkTickets = tickets.filter(t => chunkIds.includes(t.id));
-      const chunkCreatorIds = chunkTickets.map(t => t.created_by);
-      const chunkMemberUserIds = (chunkMembers.data || []).map(m => m.user_id);
-      const chunkMessageSenderIds = (chunkMessages.data || []).map(m => m.sender_id);
-
-      const neededUserIds = [...new Set([...chunkCreatorIds, ...chunkMemberUserIds, ...chunkMessageSenderIds])].filter(Boolean);
-      const missingUserIds = neededUserIds.filter(id => !usersMap.has(id));
-
-      if (missingUserIds.length > 0) {
-        const { data: fetchedUsers } = await supabaseAdmin
-          .from("users")
-          .select("id, name, email, role, profile_picture")
-          .in("id", missingUserIds);
-
-        if (fetchedUsers) {
-          fetchedUsers.forEach(u => usersMap.set(u.id, u));
-        }
-      }
-
-      // Fill lastMessagesMap for this chunk
-      if (chunkMessages.data) {
-        for (const msg of chunkMessages.data) {
-          if (!lastMessagesMap.has(msg.ticket_id)) {
-            lastMessagesMap.set(msg.ticket_id, msg);
-          }
-        }
-      }
-    }
-
-    const starredSet = new Set(starredByIds);
-
-    // 3. Messages processed in loop ^^^
-
-    // 4. Fallback Fetch for inactive tickets
-    // Calculate needing fallback
-    let ticketsNeedingFallback = new Set(ticketIds);
-    for (const [tid] of lastMessagesMap) {
-      ticketsNeedingFallback.delete(tid);
-    }
-
-    if (ticketsNeedingFallback.size > 0) {
-      const fallbackIds = Array.from(ticketsNeedingFallback);
-
-      for (let i = 0; i < fallbackIds.length; i += BATCH_SIZE) {
-        const chunk = fallbackIds.slice(i, i + BATCH_SIZE);
-
-        const batchPromises = chunk.map(async (missingTicketId) => {
-          const { data: fallbackMsg } = await supabaseAdmin
-            .from("ticket_messages")
-            .select("ticket_id, message, message_type, created_at, sender_id")
-            .eq("ticket_id", missingTicketId)
-            .order("created_at", { ascending: false })
-            .limit(1)
-            .maybeSingle();
-
-          if (fallbackMsg) {
-            lastMessagesMap.set(missingTicketId, fallbackMsg);
-          }
+      // A. Fetch Tickets + Relations
+      const { data: tickets, error } = await supabaseAdmin
+        .from("tickets")
+        .select(`*, ticket_members(user_id, role, can_message_client), ticket_files(*), starred_tickets(user_id)`)
+        .in("id", chunkIds)
+        .order("created_at", { ascending: false });
+      if (error) throw error;
+      if (tickets) {
+        // B. Manually Fetch Related Users (100% Safe from ambiguous constraints)
+        const userIds = new Set();
+        tickets.forEach(t => {
+          if (t.created_by) userIds.add(t.created_by);
+          t.ticket_members.forEach(m => userIds.add(m.user_id));
         });
 
-        await Promise.all(batchPromises);
-      }
+        const { data: usersData } = await supabaseAdmin.from("users").select("id, name, email, role, profile_picture").in("id", [...userIds]);
+        const userMap = new Map(usersData?.map(u => [u.id, u]));
+        // C. Map Data
+        const processed = await Promise.all(tickets.map(async (ticket) => {
+          // Fetch Last Message
+          const { data: lastMsg } = await supabaseAdmin.from("ticket_messages").select("message, message_type, sender_id").eq("ticket_id", ticket.id).order("created_at", { ascending: false }).limit(1).maybeSingle();
 
-      // Final User Fetch for Fallback Senders
-      const fallbackSenders = Array.from(ticketsNeedingFallback).map(tid => lastMessagesMap.get(tid)?.sender_id).filter(Boolean);
-      const missingFallbackSenders = fallbackSenders.filter(id => !usersMap.has(id));
-      if (missingFallbackSenders.length > 0) {
-        const { data: fetchFallbackUsers } = await supabaseAdmin.from("users").select("id, name, email, role, profile_picture").in("id", [...new Set(missingFallbackSenders)]);
-        if (fetchFallbackUsers) fetchFallbackUsers.forEach(u => usersMap.set(u.id, u));
+          let lastMessageText = lastMsg ? (lastMsg.message_type === 'text' ? lastMsg.message : (lastMsg.message_type === 'file' ? '📎 Sent a file' : '🖼️ Sent an image')) : null;
+          let lastMessageSender = lastMsg ? (userMap.get(lastMsg.sender_id)?.name || "Unknown") : null;
+          const creator = userMap.get(ticket.created_by);
+          const members = ticket.ticket_members.map(m => {
+            const u = userMap.get(m.user_id);
+            return { ...m, users: u, id: u?.id, name: u?.name, email: u?.email, role: m.role || u?.role, profile_picture: u?.profile_picture };
+          });
+          return {
+            ...ticket,
+            members,
+            files: ticket.ticket_files,
+            createdBy: creator,
+            isStarred: ticket.starred_tickets.some(st => st.user_id === userId),
+            lastMessage: lastMessageText,
+            lastMessageSender: lastMessageSender,
+            creator_name: creator?.name,
+            creator_email: creator?.email,
+            payment_stages: ticket.payment_stages
+          };
+        }));
+        allTickets.push(...processed);
       }
     }
 
-    // 5. Consolidated User Fetch: REMOVED (Handled incrementally)
-
-
-
-    // 7. Map everything back
-    const ticketsWithDetails = await Promise.all(tickets.map(async (ticket) => {
-      // Creator
-      const creator = usersMap.get(ticket.created_by) || {
-        id: ticket.created_by,
-        name: "Deleted User",
-        email: "deleted@user.com",
-        role: "unknown",
-        profile_picture: null,
-      };
-
-      // Members
-      const myMembers = allMembers
-        .filter(m => m.ticket_id === ticket.id)
-        .map(m => {
-          const u = usersMap.get(m.user_id);
-          if (!u) return null;
-          return { ...u, role: m.role || u.role }; // Support override role in member table if exists
-        })
-        .filter(Boolean);
-
-      // Files
-      const myFiles = allFiles.filter(f => f.ticket_id === ticket.id);
-
-      // Last Message (Retrieved from Batch Map)
-      let lastMessage = null;
-      let lastMessageSender = null;
-
-      const lastMsgData = lastMessagesMap.get(ticket.id);
-
-      if (lastMsgData) {
-        if (lastMsgData.message_type === "text") {
-          lastMessage = lastMsgData.message;
-        } else {
-          lastMessage = lastMsgData.message_type === "file" ? "📎 Sent a file" : "🖼️ Sent an image";
-        }
-        const sender = usersMap.get(lastMsgData.sender_id);
-        lastMessageSender = sender?.name || "Unknown";
-      }
-
-      return {
-        id: ticket.id,
-        ticketNumber: ticket.ticket_number,
-        uid: ticket.uid,
-        title: ticket.title,
-        description: ticket.description,
-        priority: ticket.priority,
-        status: ticket.status,
-        points: ticket.points || [],
-        createdBy: creator,
-        members: myMembers,
-        files: myFiles,
-        createdAt: ticket.created_at,
-        updatedAt: ticket.updated_at,
-        lastMessage: lastMessage,
-        lastMessageSender: lastMessageSender,
-        isStarred: starredSet.has(ticket.id),
-        // Legacy fields
-        creator_name: creator.name,
-        creator_email: creator.email,
-        payment_stages: ticket.payment_stages
-      };
-    }));
-
-    console.log(
-      `Found ${ticketsWithDetails.length} tickets for user (role: ${user.role})`
-    );
-    return successResponse(
-      res,
-      { tickets: ticketsWithDetails },
-      "Tickets fetched successfully"
-    );
+    allTickets.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    return successResponse(res, { tickets: allTickets }, "Tickets fetched successfully");
   } catch (error) {
     console.error("Get user tickets error:", error);
-    console.error("Error stack:", error.stack);
     return errorResponse(res, `Server error: ${error.message}`, 500);
   }
 };
