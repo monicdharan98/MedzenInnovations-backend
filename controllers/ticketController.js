@@ -623,11 +623,34 @@ export const getUserTickets = async (req, res) => {
 
         const { data: usersData } = await supabaseAdmin.from("users").select("id, name, email, role, profile_picture").in("id", [...userIds]);
         const userMap = new Map(usersData?.map(u => [u.id, u]));
-        // C. Map Data
-        const processed = await Promise.all(tickets.map(async (ticket) => {
-          // Fetch Last Message
-          const { data: lastMsg } = await supabaseAdmin.from("ticket_messages").select("message, message_type, sender_id").eq("ticket_id", ticket.id).order("created_at", { ascending: false }).limit(1).maybeSingle();
 
+        // C. Batch fetch last messages for all tickets in this chunk (SINGLE QUERY)
+        const { data: allMessages } = await supabaseAdmin
+          .from("ticket_messages")
+          .select("ticket_id, message, message_type, sender_id, created_at")
+          .in("ticket_id", chunkIds)
+          .order("created_at", { ascending: false });
+
+        // Build a map of ticket_id -> last message
+        const lastMessagesMap = new Map();
+        if (allMessages) {
+          for (const msg of allMessages) {
+            if (!lastMessagesMap.has(msg.ticket_id)) {
+              lastMessagesMap.set(msg.ticket_id, msg);
+            }
+          }
+        }
+
+        // Fetch any missing sender users
+        const senderIds = [...lastMessagesMap.values()].map(m => m.sender_id).filter(id => id && !userMap.has(id));
+        if (senderIds.length > 0) {
+          const { data: senderUsers } = await supabaseAdmin.from("users").select("id, name, email, role, profile_picture").in("id", [...new Set(senderIds)]);
+          if (senderUsers) senderUsers.forEach(u => userMap.set(u.id, u));
+        }
+
+        // D. Map Data (No more async calls per ticket)
+        const processed = tickets.map((ticket) => {
+          const lastMsg = lastMessagesMap.get(ticket.id);
           let lastMessageText = lastMsg ? (lastMsg.message_type === 'text' ? lastMsg.message : (lastMsg.message_type === 'file' ? '📎 Sent a file' : '🖼️ Sent an image')) : null;
           let lastMessageSender = lastMsg ? (userMap.get(lastMsg.sender_id)?.name || "Unknown") : null;
           const creator = userMap.get(ticket.created_by);
@@ -647,7 +670,7 @@ export const getUserTickets = async (req, res) => {
             creator_email: creator?.email,
             payment_stages: ticket.payment_stages
           };
-        }));
+        });
         allTickets.push(...processed);
       }
     }
