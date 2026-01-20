@@ -3961,16 +3961,12 @@ export const exportTicketsToExcel = async (req, res) => {
     const userRole = user.role;
     const isAdmin = userRole === "admin";
 
-    // Fetch all tickets with related data using Supabase joins
-    // This solves the N+1 problem by fetching everything in one query
+    // Fetch all tickets with created_by user
     const { data: tickets, error: ticketsError } = await supabaseAdmin
       .from("tickets")
       .select(`
         *,
-        created_by_user:users!created_by (id, name, role),
-        members:ticket_members (
-          user:users (id, name, role, phone)
-        )
+        created_by_user:users!created_by (id, name, role)
       `)
       .order("created_at", { ascending: false });
 
@@ -3986,15 +3982,29 @@ export const exportTicketsToExcel = async (req, res) => {
     // Get frontend URL for ticket links
     const frontendUrl = process.env.FRONTEND_URL?.split(",")[0] || "http://localhost:5173";
 
+    // Fetch all ticket members with user details in batch
+    const ticketIds = tickets.map(t => t.id);
+    const { data: allTicketMembers } = await supabaseAdmin
+      .from("ticket_members")
+      .select("ticket_id, user_id, users!ticket_members_user_id_fkey(id, name, role)")
+      .in("ticket_id", ticketIds);
+
+    // Create a map of ticket_id to members for quick lookup
+    const ticketMembersMap = new Map();
+    if (allTicketMembers) {
+      allTicketMembers.forEach(member => {
+        if (!ticketMembersMap.has(member.ticket_id)) {
+          ticketMembersMap.set(member.ticket_id, []);
+        }
+        ticketMembersMap.get(member.ticket_id).push(member.users);
+      });
+    }
+
     // Process each ticket to get all required data
     const ticketData = await Promise.all(
       tickets.map(async (ticket) => {
-        // Data is now pre-fetched via joins - no extra DB calls needed for basic info!
         const creator = ticket.created_by_user;
-        const members = ticket.members || [];
-
-        // Extract users from the members relation
-        const memberUsers = members.map(m => m.user).filter(Boolean);
+        const memberUsers = ticketMembersMap.get(ticket.id) || [];
 
         let employees = [];
         let freelancers = [];
@@ -4002,14 +4012,14 @@ export const exportTicketsToExcel = async (req, res) => {
 
         if (memberUsers.length > 0) {
           employees = memberUsers
-            .filter((u) => u.role === "employee")
+            .filter((u) => u && u.role === "employee")
             .map((u) => u.name);
           freelancers = memberUsers
-            .filter((u) => u.role === "freelancer")
+            .filter((u) => u && u.role === "freelancer")
             .map((u) => u.name);
 
           // Find client - either the creator or a member with client role
-          const clientMember = memberUsers.find((u) => u.role === "client");
+          const clientMember = memberUsers.find((u) => u && u.role === "client");
           if (clientMember) {
             clientName = clientMember.name || "N/A";
           } else if (creator && creator.role === "client") {
@@ -4020,12 +4030,11 @@ export const exportTicketsToExcel = async (req, res) => {
         }
 
         // Get client's last message
-        // Optimized: We already know who the clients are, so we only query the message
         let clientLastMessage = "N/A";
 
         // Identify client IDs for this ticket
         const clientIds = memberUsers
-          .filter(u => u.role === "client")
+          .filter(u => u && u.role === "client")
           .map(u => u.id);
 
         if (creator && creator.role === "client") {
