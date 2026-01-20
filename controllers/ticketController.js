@@ -4160,17 +4160,23 @@ export const exportTicketsToExcel = async (req, res) => {
     const dateStr = new Date().toISOString().split("T")[0];
     const filename = `tickets-export-${dateStr}.xlsx`;
 
+    // Create buffer to get content length
+    const buffer = await workbook.xlsx.writeBuffer();
+
     // Set response headers for file download
     res.setHeader(
       "Content-Type",
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     );
-    res.setHeader("Content-Disposition", `attachment; filename=${filename}`);
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.setHeader("Content-Length", buffer.length);
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
 
-    // Write to response
-    await workbook.xlsx.write(res);
+    // Write buffer to response
+    res.end(buffer);
     console.log(`✅ Exported ${ticketData.length} tickets to Excel`);
-    res.end();
   } catch (error) {
     console.error("Export tickets error:", error);
     return errorResponse(res, `Failed to export tickets: ${error.message}`, 500);
