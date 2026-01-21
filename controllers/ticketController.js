@@ -627,14 +627,17 @@ export const getUserTickets = async (req, res) => {
         // C. Batch fetch last messages for all tickets in this chunk (SINGLE QUERY)
         const { data: allMessages } = await supabaseAdmin
           .from("ticket_messages")
-          .select("ticket_id, message, message_type, sender_id, created_at")
+          .select("ticket_id, message, message_type, message_mode, sender_id, created_at")
           .in("ticket_id", chunkIds)
           .order("created_at", { ascending: false });
 
-        // Build a map of ticket_id -> last message
+        // Build a map of ticket_id -> last message (client should not see internal notes)
         const lastMessagesMap = new Map();
         if (allMessages) {
+          const isClient = req.user?.role === 'client';
           for (const msg of allMessages) {
+            // Skip internal messages for clients
+            if (isClient && msg.message_mode === 'internal') continue;
             if (!lastMessagesMap.has(msg.ticket_id)) {
               lastMessagesMap.set(msg.ticket_id, msg);
             }
