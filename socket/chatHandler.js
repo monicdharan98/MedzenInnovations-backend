@@ -230,7 +230,7 @@ export const setupChatHandlers = (io) => {
 
     /**
      * Send a message to a ticket
-     * Client emits: { ticketId: 'uuid', message: 'text', messageType: 'text', messageMode: 'client'|'internal', replyToId: 'uuid', fileUrl: '', fileName: '', fileSize: number, fileMimeType: '' }
+     * Client emits: { ticketId: 'uuid', message: 'text', messageType: 'text', messageMode: 'client'|'internal', replyToId: 'uuid', fileUrl: '', fileName: '', fileSize: number, fileMimeType: '', mentions: ['userId1', 'userId2'] }
      */
     socket.on('send_message', async (data) => {
       try {
@@ -243,10 +243,11 @@ export const setupChatHandlers = (io) => {
           replyToId = null,
           fileName = null,
           fileSize = null,
-          fileMimeType = null
+          fileMimeType = null,
+          mentions = [] // Array of user IDs who are mentioned
         } = data;
 
-        console.log(`🎯 send_message attempt: userId=${socket.user.id}, ticketId=${ticketId}, role=${socket.user.role}, messageMode=${messageMode}`);
+        console.log(`🎯 send_message attempt: userId=${socket.user.id}, ticketId=${ticketId}, role=${socket.user.role}, messageMode=${messageMode}, mentions=${mentions.length}`);
 
         // ⚡ OPTIMIZED: Use cached membership check instead of multiple DB queries
         const membershipResult = await getCachedMembership(ticketId, socket.user.id, socket.user.role);
@@ -292,7 +293,8 @@ export const setupChatHandlers = (io) => {
             file_name: fileName,
             file_size: fileSize,
             file_mime_type: fileMimeType,
-            is_read: false
+            is_read: false,
+            mentioned_users: mentions.length > 0 ? mentions : null // Store mentions
           }])
           .select('*')
           .single();
@@ -364,6 +366,11 @@ export const setupChatHandlers = (io) => {
         // Create notifications for other ticket members
         // Only notify relevant users based on message_mode
         await createTicketMessageNotification(ticketId, socket.user.id, messageType, messageMode);
+
+        // Create mention notifications for mentioned users
+        if (mentions && mentions.length > 0) {
+          await createMentionNotifications(ticketId, socket.user.id, mentions, newMessage.id);
+        }
 
         // Email notifications disabled - real-time chat only
         console.log(`⏭️ Email notifications disabled for ticket messages`);
@@ -1115,6 +1122,62 @@ export const setupChatHandlers = (io) => {
 
   return io;
 };
+
+/**
+ * Create mention notifications for mentioned users
+ * @param {string} ticketId - UUID of the ticket
+ * @param {string} senderId - UUID of the user who sent the message
+ * @param {Array} mentionedUserIds - Array of user IDs who were mentioned
+ * @param {string} messageId - UUID of the message
+ */
+async function createMentionNotifications(ticketId, senderId, mentionedUserIds, messageId) {
+  try {
+    // Get sender info
+    const { data: sender } = await supabaseAdmin
+      .from('users')
+      .select('full_name, email')
+      .eq('id', senderId)
+      .single();
+
+    // Get ticket info
+    const { data: ticket } = await supabaseAdmin
+      .from('tickets')
+      .select('title')
+      .eq('id', ticketId)
+      .single();
+
+    const senderName = sender?.full_name || sender?.email || 'Someone';
+    const ticketTitle = ticket?.title || 'a ticket';
+
+    // Create notifications for each mentioned user (except sender)
+    const notifications = mentionedUserIds
+      .filter(userId => userId !== senderId)
+      .map(userId => ({
+        user_id: userId,
+        type: 'mention',
+        title: `${senderName} mentioned you`,
+        message: `You were mentioned in "${ticketTitle}"`,
+        ticket_id: ticketId,
+        message_id: messageId,
+        is_read: false,
+        created_at: new Date().toISOString()
+      }));
+
+    if (notifications.length > 0) {
+      const { error } = await supabaseAdmin
+        .from('notifications')
+        .insert(notifications);
+
+      if (error) {
+        console.error('Error creating mention notifications:', error);
+      } else {
+        console.log(`✅ Created ${notifications.length} mention notifications`);
+      }
+    }
+  } catch (error) {
+    console.error('Error in createMentionNotifications:', error);
+  }
+}
 
 // Export cache invalidation for use in other modules (e.g., when members are updated via API)
 export { invalidateMembershipCache };
